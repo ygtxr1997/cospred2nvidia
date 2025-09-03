@@ -237,6 +237,9 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
 
         # transform first frame and actions to tensor
         vid_input = torch.from_numpy(first_frame).permute(2, 0, 1)[None, :, None, ...]
+        # vid_input = torch.from_numpy(first_frame).permute(3, 0, 1, 2)  # (THWC) -> (C, T, H, W)
+        # vid_input = vid_input[None, ...]  # Add batch dimension (1,
+        # print("first_frame", first_frame.shape, "vid_input", vid_input.shape)
         actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)[None, ...]
 
         # Prepare the data batch with text embeddings

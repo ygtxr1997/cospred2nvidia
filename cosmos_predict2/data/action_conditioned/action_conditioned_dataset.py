@@ -367,12 +367,26 @@ class ActionConditionedDataset(Dataset):
                 t5_embeddings = np.squeeze(np.load(ann_file.replace(".json", ".npy")))
                 data["t5_text_embeddings"] = torch.from_numpy(t5_embeddings).cuda()
             else:
-                data["t5_text_embeddings"] = torch.zeros(512, 1024, dtype=torch.bfloat16).cuda()
-            data["t5_text_mask"] = torch.ones(512, dtype=torch.int64).cuda()
+                data["t5_text_embeddings"] = torch.zeros(512, 1024, dtype=torch.bfloat16)  #.cuda()
+            data["t5_text_mask"] = torch.ones(512, dtype=torch.int64)  #.cuda()
             data["fps"] = 4
-            data["image_size"] = 256 * torch.ones(4).cuda()  # TODO: Does this matter?
+            data["image_size"] = 256 * torch.ones(4)  #.cuda()  # TODO: Does this matter?
             data["num_frames"] = self.sequence_length
-            data["padding_mask"] = torch.zeros(1, 256, 256).cuda()
+            data["padding_mask"] = torch.zeros(1, 256, 256)  #.cuda()
+
+            '''
+            sample: Dict,keys=dict_keys(['action', 'video', 'annotation_file', '__key__', 't5_text_embeddings', 't5_text_mask', 'fps', 'image_size', 'num_frames', 'padding_mask'])
+            action,<class 'torch.Tensor'>,shape=torch.Size([12, 7]), in [-1.2,2.2]
+            video,<class 'torch.Tensor'>,shape=torch.Size([3, 13, 480, 640]), in [0,255]
+            annotation_file:<class 'str'>,len=46, "../datasets/bridge/annotation/train/10035.json"
+            __key__:<class 'str'>,len=5
+            t5_text_embeddings,<class 'torch.Tensor'>,shape=torch.Size([512, 1024])
+            t5_text_mask,<class 'torch.Tensor'>,shape=torch.Size([512])
+            fps:<class 'int'>,4
+            image_size,<class 'torch.Tensor'>,shape=torch.Size([4]),  (t_h,t_w,ori_h,ori_w)
+            num_frames:<class 'int'>,13
+            padding_mask,<class 'torch.Tensor'>,shape=torch.Size([1, 256, 256])
+            '''
 
             return data
         except Exception:

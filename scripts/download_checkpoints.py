@@ -183,68 +183,78 @@ def main(args):
     # Create local checkpoints folder
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    # Download the Cosmos-Predict2 models
-    model_size_mapping = {"0.6B": "Cosmos-Predict2-0.6B", "2B": "Cosmos-Predict2-2B", "14B": "Cosmos-Predict2-14B"}
-    model_type_mapping = {
-        "text2image": "Text2Image",
-        "video2world": "Video2World",
-        "sample_gr00t_dreams_gr1": "Sample-GR00T-Dreams-GR1",
-        "sample_gr00t_dreams_droid": "Sample-GR00T-Dreams-DROID",
-        "multiview": "Multiview",
-    }
-    if "text2image" in args.model_types:
-        for size in args.model_sizes:
-            repo_id = f"nvidia/{model_size_mapping[size]}-{model_type_mapping['text2image']}"
-            download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5)
-
-    if "video2world" in args.model_types:
-        for size in args.model_sizes:
-            for fps in args.fps:
-                for res in args.resolution:
-                    repo_id = f"nvidia/{model_size_mapping[size]}-{model_type_mapping['video2world']}"
-                    allow_patterns = f"model-{res}p-{fps}fps.pt"
-                    download_model(
-                        args.checkpoint_dir, repo_id, verify_md5=args.verify_md5, allow_patterns=allow_patterns
-                    )
-                    # Sparse variant (if any)
-                    if args.natten and res == "720":
-                        download_model(
-                            args.checkpoint_dir,
-                            repo_id,
-                            verify_md5=args.verify_md5,
-                            allow_patterns=f"model-{res}p-{fps}fps-natten.pt",
-                        )
-
-            # donwload the remaining
-            repo_id = f"nvidia/{model_size_mapping[size]}-{model_type_mapping['video2world']}"
-            download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5, allow_patterns="tokenizer/*")
-        download_model(args.checkpoint_dir, "nvidia/Cosmos-Reason1-7B", verify_md5=args.verify_md5)
-    
-    if "multiview" in args.model_types:
-        repo_id = f"nvidia/Cosmos-Predict2-2B-Multiview"
-        download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5, allow_patterns="*.pt")
-
-    if "sample_action_conditioned" in args.model_types:
-        print("NOTE: Sample Action Conditioned model is only available for 2B model size, 480P and 4FPS")
-        repo_id = "nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned"
-        download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5)
-
-    # Download the GR00T models
-    if "sample_gr00t_dreams_gr1" in args.model_types:
-        repo_id = f"nvidia/{model_size_mapping['14B']}-{model_type_mapping['sample_gr00t_dreams_gr1']}"
-        download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5)
-
-    if "sample_gr00t_dreams_droid" in args.model_types:
-        repo_id = f"nvidia/{model_size_mapping['14B']}-{model_type_mapping['sample_gr00t_dreams_droid']}"
-        download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5)
-
-    # Download T5 model
-    download_model(args.checkpoint_dir, "google-t5/t5-11b", verify_md5=args.verify_md5, ignore_patterns=["tf_model.h5"])
+    # # Download the Cosmos-Predict2 models
+    # model_size_mapping = {"0.6B": "Cosmos-Predict2-0.6B", "2B": "Cosmos-Predict2-2B", "14B": "Cosmos-Predict2-14B"}
+    # model_type_mapping = {
+    #     "text2image": "Text2Image",
+    #     "video2world": "Video2World",
+    #     "sample_gr00t_dreams_gr1": "Sample-GR00T-Dreams-GR1",
+    #     "sample_gr00t_dreams_droid": "Sample-GR00T-Dreams-DROID",
+    #     "multiview": "Multiview",
+    # }
+    # if "text2image" in args.model_types:
+    #     for size in args.model_sizes:
+    #         repo_id = f"nvidia/{model_size_mapping[size]}-{model_type_mapping['text2image']}"
+    #         download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5)
+    #
+    # if "video2world" in args.model_types:
+    #     for size in args.model_sizes:
+    #         for fps in args.fps:
+    #             for res in args.resolution:
+    #                 repo_id = f"nvidia/{model_size_mapping[size]}-{model_type_mapping['video2world']}"
+    #                 allow_patterns = f"model-{res}p-{fps}fps.pt"
+    #                 download_model(
+    #                     args.checkpoint_dir, repo_id, verify_md5=args.verify_md5, allow_patterns=allow_patterns
+    #                 )
+    #                 # Sparse variant (if any)
+    #                 if args.natten and res == "720":
+    #                     download_model(
+    #                         args.checkpoint_dir,
+    #                         repo_id,
+    #                         verify_md5=args.verify_md5,
+    #                         allow_patterns=f"model-{res}p-{fps}fps-natten.pt",
+    #                     )
+    #
+    #         # donwload the remaining
+    #         repo_id = f"nvidia/{model_size_mapping[size]}-{model_type_mapping['video2world']}"
+    #         download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5, allow_patterns="tokenizer/*")
+    #     download_model(args.checkpoint_dir, "nvidia/Cosmos-Reason1-7B", verify_md5=args.verify_md5)
+    #
+    # if "multiview" in args.model_types:
+    #     repo_id = f"nvidia/Cosmos-Predict2-2B-Multiview"
+    #     download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5, allow_patterns="*.pt")
+    #
+    # if "sample_action_conditioned" in args.model_types:
+    #     print("NOTE: Sample Action Conditioned model is only available for 2B model size, 480P and 4FPS")
+    #     repo_id = "nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned"
+    #     download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5)
+    #
+    # # Download the GR00T models
+    # if "sample_gr00t_dreams_gr1" in args.model_types:
+    #     repo_id = f"nvidia/{model_size_mapping['14B']}-{model_type_mapping['sample_gr00t_dreams_gr1']}"
+    #     download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5)
+    #
+    # if "sample_gr00t_dreams_droid" in args.model_types:
+    #     repo_id = f"nvidia/{model_size_mapping['14B']}-{model_type_mapping['sample_gr00t_dreams_droid']}"
+    #     download_model(args.checkpoint_dir, repo_id, verify_md5=args.verify_md5)
+    #
+    # # Download T5 model
+    # download_model(args.checkpoint_dir, "google-t5/t5-11b", verify_md5=args.verify_md5, ignore_patterns=["tf_model.h5"])
 
     # Download the guardrail models
-    download_model(args.checkpoint_dir, "nvidia/Cosmos-Guardrail1", verify_md5=args.verify_md5)
+    # download_model(args.checkpoint_dir, "nvidia/Cosmos-Guardrail1", verify_md5=args.verify_md5)
+    # download_model(
+    #     args.checkpoint_dir, "meta-llama/Llama-Guard-3-8B", verify_md5=args.verify_md5, ignore_patterns=["original/*"]
+    # )
+
+    # Download the action-conditioned model
+    res=720
+    fps=16
     download_model(
-        args.checkpoint_dir, "meta-llama/Llama-Guard-3-8B", verify_md5=args.verify_md5, ignore_patterns=["original/*"]
+        args.checkpoint_dir,
+        "nvidia/Cosmos-Predict2-2B-Video2World",
+        verify_md5=args.verify_md5,
+        allow_patterns=f"model-{res}p-{fps}fps.pt"
     )
 
     print("Checkpoint downloading done.")

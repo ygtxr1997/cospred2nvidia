@@ -15,18 +15,20 @@
 
 from hydra.core.config_store import ConfigStore
 
-from cosmos_predict2.configs.action_conditioned.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
-from cosmos_predict2.models.video2world_action_model import Predict2Video2WorldActionConditionedModel
+# from cosmos_predict2.configs.action_conditioned.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
+# from cosmos_predict2.models.video2world_action_model import Predict2Video2WorldActionConditionedModel
+from cosmos_predict2.configs.expert.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT
+from cosmos_predict2.models.video2world_expert_model import Predict2Video2WorldExpertModel
 from cosmos_predict2.models.video2world_model import Predict2ModelManagerConfig, Predict2Video2WorldModelConfig
 from imaginaire.lazy_config import LazyCall as L
 
-PREDICT2_V2W_2B_ACTION_CONDITIONED_FSDP_CONFIG = dict(
+PREDICT2_V2W_2B_EXPERT_FSDP_CONFIG = dict(
     trainer=dict(
         distributed_parallelism="fsdp",
     ),
-    model=L(Predict2Video2WorldActionConditionedModel)(
+    model=L(Predict2Video2WorldExpertModel)(
         config=Predict2Video2WorldModelConfig(
-            pipe_config=PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED,
+            pipe_config=PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT,
             model_manager_config=L(Predict2ModelManagerConfig)(
                 dit_path="checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/model-720p-16fps.pt",  # default
                 # dit_path="checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/model-480p-10fps.pt",
@@ -41,12 +43,12 @@ PREDICT2_V2W_2B_ACTION_CONDITIONED_FSDP_CONFIG = dict(
 )
 
 
-def register_model_action_conditioned() -> None:
+def register_model_expert() -> None:
     cs = ConfigStore.instance()
     # predict2 v2w 2b model
     cs.store(
         group="model",
         package="_global_",
-        name="predict2_v2w_2b_action_conditioned_fsdp",
-        node=PREDICT2_V2W_2B_ACTION_CONDITIONED_FSDP_CONFIG,
+        name="predict2_v2w_2b_expert_fsdp",
+        node=PREDICT2_V2W_2B_EXPERT_FSDP_CONFIG,
     )

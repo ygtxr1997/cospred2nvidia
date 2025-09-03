@@ -97,6 +97,7 @@ def attention(
     causal=False,
     deterministic=False,
     dtype=torch.bfloat16,
+    sdpa_attn_mask=None,  # mask for SDPA, shape (..., seq_len_q, seq_len_k)
 ):
     supported_dtypes = [torch.bfloat16, torch.float16, torch.float32]
     is_half = dtype in [torch.bfloat16, torch.float16]
@@ -161,11 +162,18 @@ def attention(
             sdpa_kernel_ = sdpa_kernel
             SDPA_BACKENDS = [BEST_SDPA_BACKEND]
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+        q = q.transpose(1, 2)  # (B,nh,seq_q,d)
+        k = k.transpose(1, 2)  # (B,nh,seq_q/seq_k,d)
         v = v.transpose(1, 2)
 
         with sdpa_kernel_(backends=SDPA_BACKENDS):
+            if sdpa_attn_mask is not None:
+                # Check the mask shape
+                assert sdpa_attn_mask.dim() >= 2, f"sdpa_attn should have at least 2 dims, got {sdpa_attn_mask.shape}"
+                assert sdpa_attn_mask.shape[-2] == q.shape[-2] and sdpa_attn_mask.shape[-1] == k.shape[-2], (
+                    f"sdpa_attn_mask shape {sdpa_attn_mask.shape} is not compatible with q {q.shape} and k {k.shape}"
+                )
+
             out = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
@@ -174,6 +182,13 @@ def attention(
                 dropout_p=dropout_p,
                 scale=softmax_scale,
             )
+            '''
+            q.shape: torch.Size([1, 16, 1024, 128]) k.shape: torch.Size([1, 16, 1024, 128]) v.shape: torch.Size([1, 16, 1024, 128])
+            q.shape: torch.Size([1, 16, 1024, 128]) k.shape: torch.Size([1, 16, 512, 128]) v.shape: torch.Size([1, 16, 512, 128])
+            q: (B, num_heads, seq_len_q, head_dim)
+            k: (B, num_heads, seq_len_k, head_dim)
+            v: (B, num_heads, seq_len_k, head_dim)
+            '''
 
         out = out.transpose(1, 2).contiguous()
         return out

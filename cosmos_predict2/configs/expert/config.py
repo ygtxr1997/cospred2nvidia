@@ -22,12 +22,13 @@ from cosmos_predict2.configs.base.config_video2world import (
 )
 from cosmos_predict2.configs.base.defaults.ema import EMAConfig
 from cosmos_predict2.models.text2image_dit import SACConfig
-from cosmos_predict2.models.video2world_action_dit import ActionConditionedMinimalV1LVGDiT
+# from cosmos_predict2.models.video2world_action_dit import ActionConditionedMinimalV1LVGDiT
+from cosmos_predict2.models.video2world_expert_dit import ExpertMinimalV1LVGDiT
 from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
 from imaginaire.lazy_config import LazyCall as L
 
 # Modified: action_conditioned/config.py PREDICT2_VIDEO2WORLD_NET_2B_ACTION_CONDITIONED
-PREDICT2_VIDEO2WORLD_NET_2B_ACTION_CONDITIONED = L(ActionConditionedMinimalV1LVGDiT)(
+PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
     max_img_h=240,
     max_img_w=240,
     max_frames=128,
@@ -57,11 +58,19 @@ PREDICT2_VIDEO2WORLD_NET_2B_ACTION_CONDITIONED = L(ActionConditionedMinimalV1LVG
         mode="predict2_2b_720",
     ),
     # NOTE: add action dimension
-    action_dim=2 * 12,  # ori:7*12
+    action_dim=2 * 12,  # (act_dim * horizon), ori:7*12
+    # NOTE: add expert params
+    action_dof=2,  # pusht: 2-DoF; robotic arm: 7-DoF;
+    ex_num_latent_frames=4,  # (B,T,1,W,D), T=num_latent_frames, can be different from video
+    ex_num_tokens_per_latent_frame=16,  # W=num_tokens_per_frame, embeddings repeat times
+    ex_dim=512,  # expert feature dimension, D=dim
+    ex_num_heads=16,
+    ex_mlp_ratio=4.0,
+    ex_adaln_lora_dim=128,
 )
 
 # Modified: action_conditioned/config.py PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
-PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED = Video2WorldPipelineConfig(
+PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldPipelineConfig(
     adjust_video_noise=True,
     conditioner=L(ActionConditioner)(
         fps=L(ReMapkey)(
@@ -85,6 +94,7 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED = Video2WorldPipelineConfig(
             input_key="fps",
             output_key="use_video_condition",
         ),
+        ## NOTE: unlike action_conditioned, expert takes action as additional input instead of crossattn_emb
         # NOTE: add additional action as condition
         action=L(ReMapkey)(
             input_key="action",
@@ -96,7 +106,7 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED = Video2WorldPipelineConfig(
     conditioning_strategy=str(ConditioningStrategy.FRAME_REPLACE),
     min_num_conditional_frames=1,
     max_num_conditional_frames=1,
-    net=PREDICT2_VIDEO2WORLD_NET_2B_ACTION_CONDITIONED,
+    net=PREDICT2_VIDEO2WORLD_NET_2B_EXPERT,  # modified
     precision="bfloat16",
     rectified_flow_t_scaling_factor=1.0,
     rectified_flow_loss_weight_uniform=True,

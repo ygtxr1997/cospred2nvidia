@@ -101,19 +101,19 @@ bridge_val_dataloader = L(DataLoader)(
 )
 
 
-def register_training_and_val_data_action_conditioned():
+def register_training_and_val_data_expert():
     cs = ConfigStore.instance()
 
     # for local dataset
     cs.store(
         group="dataloader_train",
         package="dataloader_train",
-        name="bridge_train",
+        name="pusht_train",
         node=bridge_train_dataloader,
     )
     cs.store(
         group="dataloader_val",
         package="dataloader_val",
-        name="bridge_val",
+        name="pusht_val",
         node=bridge_val_dataloader,
     )

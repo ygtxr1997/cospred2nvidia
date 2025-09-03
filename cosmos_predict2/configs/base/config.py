@@ -17,6 +17,8 @@ from typing import Any, List
 
 import attrs
 
+from cosmos_predict2.configs.expert.defaults.data import register_training_and_val_data_expert
+from cosmos_predict2.configs.expert.defaults.model import register_model_expert
 from cosmos_predict2.configs.action_conditioned.defaults.data import register_training_and_val_data_action_conditioned
 from cosmos_predict2.configs.action_conditioned.defaults.model import register_model_action_conditioned
 from cosmos_predict2.configs.base.defaults.callbacks import register_callbacks
@@ -86,12 +88,17 @@ def make_config() -> Config:
     register_callbacks()
 
     # action conditional post-training config
-    register_training_and_val_data_action_conditioned()
-    register_model_action_conditioned()
+    # register_training_and_val_data_action_conditioned()
+    # register_model_action_conditioned()
+
+    # expert post-training config
+    register_training_and_val_data_expert()
+    register_model_expert()
 
     # experiment config are defined in the experiment folder
     # call import_all_modules_from_package to register them
     import_all_modules_from_package("cosmos_predict2.configs.base.experiment", reload=True)
     import_all_modules_from_package("cosmos_predict2.configs.base.experiment.multiview", reload=True)
-    import_all_modules_from_package("cosmos_predict2.configs.action_conditioned.experiment", reload=True)
+    # import_all_modules_from_package("cosmos_predict2.configs.action_conditioned.experiment", reload=True)
+    import_all_modules_from_package("cosmos_predict2.configs.expert.experiment", reload=True)
     return c

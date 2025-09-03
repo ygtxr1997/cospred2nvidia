@@ -38,7 +38,7 @@ NUM_CONDITIONAL_FRAMES_KEY: str = "num_conditional_frames"
 
 
 # Modified: pipelines/video2world.py Video2WorldActionConditionedPipeline
-class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
+class Video2WorldExpertPipeline(Video2WorldPipeline):
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype)
 
@@ -52,7 +52,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         load_prompt_refiner: bool = False,
     ) -> Any:
         # Create a pipe
-        pipe = Video2WorldActionConditionedPipeline(device=device, torch_dtype=torch_dtype)
+        pipe = Video2WorldExpertPipeline(device=device, torch_dtype=torch_dtype)
         pipe.config = config
         pipe.precision = {
             "float32": torch.float32,
@@ -266,7 +266,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             _W // self.tokenizer.spatial_compression_factor,
         ]
 
-        x0_fn = self.get_x0_fn_from_batch(data_batch, guidance, is_negative_prompt=True)
+        x0_fn = self.get_x0_fn_from_batch(data_batch, guidance, is_negative_prompt=True)  # will call self.denoise
 
         log.info("Starting video generation...")
 

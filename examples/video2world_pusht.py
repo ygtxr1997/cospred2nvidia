@@ -28,21 +28,16 @@ from megatron.core import parallel_state
 
 from cosmos_predict2.configs.action_conditioned.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
 from cosmos_predict2.pipelines.video2world_action import Video2WorldActionConditionedPipeline
+from cosmos_predict2.data.action_conditioned.pusht_dataset import PushTImageDataset
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video
 
 
-def get_action_sequence(annotation_path):
-    with open(annotation_path, "r") as file:
-        data = json.load(file)
-
-    # rescale the action to the original scale
-    action_ee = np.array(data["action"])[:, :6] * 20
-    gripper = np.array(data["continuous_gripper_state"])[1:, None]
-
-    # concatenate the end-effector displacement and gripper width
-    action = np.concatenate([action_ee, gripper], axis=1)
-    return action
+def get_action_sequence(val_dataset, dataset_index=0):
+    data = val_dataset[dataset_index]
+    action = data["action"]  # (T,2), in [0,1]
+    video = data["video"].permute(1, 2, 3, 0)  # (3,T,256,256)->(T,H,W,C), in [0,255]
+    return action.numpy(), video.numpy()
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         help="Use EMA weights for generation.",
     )
 
+    parser.add_argument(
+        "--dataset_index",
+        type=int,
+        default=0,
+        help="Index of the dataset.",
+    )
     parser.add_argument(
         "--frame_index",
         type=int,
@@ -172,18 +173,29 @@ def setup_pipeline(args: argparse.Namespace):
     return pipe
 
 
-def read_first_frame(video_path, frame_index=0):
-    video = mp.read_video(video_path)  # Returns (T, H, W, C) numpy array
+def read_first_frame(val_dataset, dataset_index=0, frame_index=0):
+    data = val_dataset[dataset_index]
+    video = data["video"]  # (3,T,96,96), in [0,255]
+    video = video.permute(1, 2, 3, 0).cpu().numpy()  # (T,96,96,3), in [0,255]
     print("[DEBUG] Video shape:", video.shape)
     return video[frame_index]  # Return first frame as numpy array
 
 
 def process_single_generation(
-    pipe, input_path, input_annotation, output_path, guidance, seed, chunk_size, autoregressive,
-    frame_index=0,
+    pipe, input_path, output_path, guidance, seed, chunk_size, autoregressive,
+    dataset_index=0, frame_index=0,
 ):
-    actions = get_action_sequence(input_annotation)
-    first_frame = read_first_frame(input_path, frame_index=frame_index)
+    pusht_val_dataset = PushTImageDataset(
+        zarr_path=input_path,  #"./datasets/pusht/pusht_orange_random_v2.zarr",
+        horizon=60,
+        pad_before=0,
+        pad_after=8,
+    )
+    actions, frames = get_action_sequence(pusht_val_dataset, dataset_index=dataset_index)
+    # actions: (T,2), in [0,1]
+    # frames: (T,H,W,C), in [0,255]
+    first_frame = read_first_frame(pusht_val_dataset, dataset_index=dataset_index, frame_index=frame_index)
+    # first_frame: (H,W,C), in [0,255]
 
     log.info(f"Running Video2WorldPipeline\ninput: {input_path}")
 
@@ -195,13 +207,14 @@ def process_single_generation(
                 log.info("Reached end of actions")
                 break
             video = pipe(
-                first_frame,
+                # first_frame,
+                frames[i],
                 actions[i : i + chunk_size],
                 num_conditional_frames=1,
                 guidance=guidance,
                 seed=i,
-            )
-            first_frame = ((video[0, :, -1].permute(1, 2, 0).cpu().numpy() / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
+            )  # (B,C,T,H,W), in [-1,1]
+            # first_frame = ((video[0, :, -1].permute(1, 2, 0).cpu().numpy() / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
             video_chunks.append(video)
         video = torch.cat([video_chunks[0]] + [chunk[:, :, :-1] for chunk in video_chunks[1:]], dim=2)
     else:
@@ -214,13 +227,20 @@ def process_single_generation(
         )
 
     if video is not None:
+        save_fps = 5  # use lower fps for clearer visualization
+
         # save the generated video
         output_dir = os.path.dirname(output_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
         log.info(f"Saving generated video to: {output_path}")
-        save_image_or_video(video, output_path, fps=4)
+        save_image_or_video(video, output_path, fps=save_fps)
         log.success(f"Successfully saved video to: {output_path}")
+
+        # save the ground truth video for comparison
+        gt_output_path = output_path.replace(".mp4", "_gt.mp4")
+        save_image_or_video(torch.from_numpy(frames).permute(3, 0, 1, 2) / 255., gt_output_path, fps=save_fps)
+        log.success(f"Successfully saved ground truth video to: {gt_output_path}")
         return True
     return False
 
@@ -229,12 +249,12 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldActionConditionedP
     process_single_generation(
         pipe=pipe,
         input_path=args.input_video,
-        input_annotation=args.input_annotation,
         output_path=args.save_path,
         guidance=args.guidance,
         seed=args.seed,
         chunk_size=args.chunk_size,
         autoregressive=args.autoregressive,
+        dataset_index=args.dataset_index,
         frame_index=args.frame_index,
     )
     return

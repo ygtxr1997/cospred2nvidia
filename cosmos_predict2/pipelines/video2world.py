@@ -501,20 +501,30 @@ class Video2WorldPipeline(BasePipeline):
 
             if self.config.resize_online:
 
-                def temporal_sample(video: torch.Tensor, expected_length: int) -> torch.Tensor:
-                    # sample consecutive video frames to match expected_length
-                    original_length = video.shape[2]
-                    if original_length != expected_length:
-                        # video in [B C T H W] format
-                        start_frame = np.random.randint(0, original_length - expected_length)
-                        end_frame = start_frame + expected_length
-                        video = video[:, :, start_frame:end_frame, :, :]
-                    return video
+                # def temporal_sample(video: torch.Tensor, expected_length: int) -> torch.Tensor:
+                #     # sample consecutive video frames to match expected_length
+                #     print("video.shape", video.shape, "; expected_length", expected_length)
+                #     original_length = video.shape[2]
+                #     if original_length != expected_length:
+                #         # video in [B C T H W] format
+                #         start_frame = np.random.randint(0, original_length - expected_length)
+                #         # start_frame = 0
+                #         end_frame = start_frame + expected_length
+                #         video = video[:, :, start_frame:end_frame, :, :]
+                #     return video
+                #
+                # expected_length = self.tokenizer.get_pixel_num_frames(self.config.state_t)
+                # original_length = data_batch[input_key].shape[2]
+                # if original_length != expected_length:
+                #     data_batch[input_key] = temporal_sample(data_batch[input_key], expected_length)
 
+                from torchvision.transforms.v2 import UniformTemporalSubsample
                 expected_length = self.tokenizer.get_pixel_num_frames(self.config.state_t)
                 original_length = data_batch[input_key].shape[2]
                 if original_length != expected_length:
-                    data_batch[input_key] = temporal_sample(data_batch[input_key], expected_length)
+                    video = rearrange(data_batch[input_key], "b c t h w -> b t c h w")
+                    video = UniformTemporalSubsample(expected_length)(video)
+                    data_batch[input_key] = rearrange(video, "b t c h w -> b c t h w")
 
     def _augment_image_dim_inplace(self, data_batch: dict[str, torch.Tensor], input_key: str = None) -> None:
         input_key = self.input_image_key if input_key is None else input_key
@@ -608,6 +618,7 @@ class Video2WorldPipeline(BasePipeline):
     ) -> DenoisePrediction:
         """
         Performs denoising on the input noise data, noise level, and condition
+        Called when doing training or inference.
 
         Args:
             xt (torch.Tensor): The input noise data.

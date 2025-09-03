@@ -1043,10 +1043,18 @@ class Block(nn.Module):
         gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d")
 
         B, T, H, W, D = x_B_T_H_W_D.shape
+        '''
+        D == self.x_dim == model_channels
+        crossattn_emb.shape[-1] == context_dim == crossattn_emb_channels
+        x_B_T_H_W_D.shape: torch.Size([1, 4, 16, 16, 2048]) 
+        crossattn_emb.shape: torch.Size([1, 512, 1024])
+        '''
 
+        # (1) Self-Attention
         def _fn(_x_B_T_H_W_D, _norm_layer, _scale_B_T_1_1_D, _shift_B_T_1_1_D):
             return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
 
+        # (1.1) LayerNorm + AdaLN
         normalized_x_B_T_H_W_D = _fn(
             x_B_T_H_W_D,
             self.layer_norm_self_attn,
@@ -1059,6 +1067,7 @@ class Block(nn.Module):
         if self.cp_size is not None and self.cp_size > 1:
             video_size = VideoSize(T=T * self.cp_size, H=H, W=W)
 
+        # (1.2) Self-Attention + RoPE + AdaLN
         result_B_T_H_W_D = rearrange(
             self.self_attn(
                 # normalized_x_B_T_HW_D,
@@ -1074,6 +1083,7 @@ class Block(nn.Module):
         )
         x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result_B_T_H_W_D
 
+        # (2) Cross-Attention
         def _x_fn(
             _x_B_T_H_W_D: torch.Tensor,
             layer_norm_cross_attn: Callable,
@@ -1096,6 +1106,8 @@ class Block(nn.Module):
             )
             return _result_B_T_H_W_D
 
+        # (2.1) LayerNorm + AdaLN
+        # (2.2) Cross-Attention + AdaLN
         result_B_T_H_W_D = _x_fn(
             x_B_T_H_W_D,
             self.layer_norm_cross_attn,
@@ -1104,12 +1116,15 @@ class Block(nn.Module):
         )
         x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
 
+        # (3) MLP
+        # (3.1) LayerNorm + AdaLN
         normalized_x_B_T_H_W_D = _fn(
             x_B_T_H_W_D,
             self.layer_norm_mlp,
             scale_mlp_B_T_1_1_D,
             shift_mlp_B_T_1_1_D,
         )
+        # (3.2) MLP + AdaLN
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
         return x_B_T_H_W_D

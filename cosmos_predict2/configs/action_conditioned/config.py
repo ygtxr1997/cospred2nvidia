@@ -57,7 +57,7 @@ PREDICT2_VIDEO2WORLD_NET_2B_ACTION_CONDITIONED = L(ActionConditionedMinimalV1LVG
         mode="predict2_2b_720",
     ),
     # NOTE: add action dimension
-    action_dim=7 * 12,
+    action_dim=2 * 12,  # ori:7*12
 )
 
 PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED = Video2WorldPipelineConfig(
@@ -100,12 +100,12 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED = Video2WorldPipelineConfig(
     rectified_flow_t_scaling_factor=1.0,
     rectified_flow_loss_weight_uniform=True,
     resize_online=True,
-    resolution="720",
+    resolution="720",  # ori:720
     ema=L(EMAConfig)(enabled=False),  # defaults to inference
     sigma_conditional=0.0001,
     sigma_data=1.0,
     state_ch=16,
-    state_t=4,
+    state_t=4,  # ori:4
     text_encoder_class="T5",
     tokenizer=L(TokenizerInterface)(
         chunk_duration=81,
