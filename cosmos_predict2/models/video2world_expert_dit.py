@@ -339,6 +339,22 @@ class BlockWExpert(Block):
             ex_t_embedding_B_T_D: Optional[torch.Tensor] = None,
             ex_adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
     ):
+        # print("[DEBUG] Enter BlockWExpert forward", "x_B_T_H_W_D:", x_B_T_H_W_D.shape,
+        #       "emb_B_T_D:", emb_B_T_D.shape, "rope_emb_L_1_1_D:", rope_emb_L_1_1_D.shape,
+        #       "adaln_lora_B_T_3D:", adaln_lora_B_T_3D.shape,
+        #       "ex_B_T_1_W_D:", ex_B_T_1_W_D.shape, "ex_rope_emb_L_1_1_D:", ex_rope_emb_L_1_1_D.shape,
+        #       "ex_t_embedding_B_T_D:", ex_t_embedding_B_T_D.shape,
+        #       "ex_adaln_lora_B_T_3D:", ex_adaln_lora_B_T_3D.shape)
+        '''
+        x_B_T_H_W_D: torch.Size([12, 2, 16, 16, 2048]) 
+        emb_B_T_D: torch.Size([12, 2, 2048]) 
+        rope_emb_L_1_1_D: torch.Size([512, 1, 1, 128]) 
+        adaln_lora_B_T_3D: torch.Size([12, 2, 6144]) 
+        ex_B_T_1_W_D: torch.Size([12, 16, 1, 4, 512]) 
+        ex_rope_emb_L_1_1_D: torch.Size([64, 1, 1, 128])
+        ex_t_embedding_B_T_D: torch.Size([12, 12, 512]) 
+        ex_adaln_lora_B_T_3D: torch.Size([12, 12, 1536])
+        '''
         #### <<<< Copied from parent class <<<< ####
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
@@ -573,6 +589,31 @@ class Mlp(nn.Module):
         torch.nn.init.zeros_(self.fc2.bias)
 
 
+class ActionEncoder(nn.Module):
+    def __init__(self, in_features: int, output_dim: int):
+        super().__init__()
+        self.layer = nn.Linear(in_features, output_dim)
+    def forward(self, x):
+        return self.layer(x)
+    def init_weights(self) -> None:
+        std = 1.0 / math.sqrt(self.layer.in_features)
+        torch.nn.init.trunc_normal_(self.layer.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.zeros_(self.layer.bias)
+
+
+class ActionDecoder(nn.Module):
+    def __init__(self, in_features: int, output_dim: int):
+        super().__init__()
+        self.ln_f = nn.LayerNorm(in_features)
+        self.head = nn.Linear(in_features, output_dim)
+    def forward(self, x):
+        return self.head(self.ln_f(x))
+    def init_weights(self) -> None:
+        std = 1.0 / math.sqrt(self.head.in_features)
+        torch.nn.init.trunc_normal_(self.head.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.zeros_(self.head.bias)
+
+
 # Modified: models/video2world_action_dit.py ActionConditionedMinimalV1LVGDiT
 class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
     def __init__(self, *args, **kwargs):
@@ -601,16 +642,23 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         super().__init__(*args, **kwargs)
 
         # Add action encoder
+        self.ex_dim = ex_dim
+        self.ex_num_latent_frames = ex_num_latent_frames
         self.action_t_embedder = nn.Sequential(
             Timesteps(ex_dim),
             TimestepEmbedding(ex_dim, ex_dim, use_adaln_lora=kwargs["use_adaln_lora"]),
         )
-        self.action_embedder_B_D = Mlp(
-            in_features=action_dim,
-            hidden_features=ex_dim * 4,
-            out_features=ex_dim * ex_num_latent_frames,
-            act_layer=lambda: nn.GELU(approximate="tanh"),
-            drop=0,
+        self.action_t_embedding_norm = te.pytorch.RMSNorm(ex_dim, eps=1e-6)
+        # self.action_embedder_B_D = Mlp(
+        #     in_features=action_dim,
+        #     hidden_features=ex_dim * 2,  # How large the hidden layer should be?
+        #     out_features=ex_dim * ex_num_latent_frames,
+        #     act_layer=lambda: nn.GELU(approximate="tanh"),
+        #     drop=0,
+        # )
+        self.action_embedder_B_D = ActionEncoder(
+            in_features=action_dim + (action_dim // action_dof),  # 1 means the conditioning mask
+            output_dim=ex_dim * ex_num_latent_frames,
         )
         # NOTE: action is no more taken as the crossattn_emb
         # self.action_embedder_B_3D = Mlp(
@@ -649,12 +697,16 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         )
 
         # Add action decoder
-        self.action_decoder_B_D = Mlp(
-            in_features=ex_dim * 4 * ex_num_tokens_per_latent_frame,
-            hidden_features=action_dim * 4,  # can be simpler
-            out_features=action_dim,  # action_dim = horizon * action_dof
-            act_layer=lambda: nn.GELU(approximate="tanh"),
-            drop=0,
+        # self.action_decoder_B_D = Mlp(
+        #     in_features=ex_dim * ex_num_latent_frames * ex_num_tokens_per_latent_frame,
+        #     hidden_features=action_dim * 4,  # can be simpler
+        #     out_features=action_dim,  # action_dim = horizon * action_dof
+        #     act_layer=lambda: nn.GELU(approximate="tanh"),
+        #     drop=0,
+        # )
+        self.action_decoder_B_D = ActionDecoder(
+            in_features=ex_dim * ex_num_latent_frames * ex_num_tokens_per_latent_frame,
+            output_dim=action_dim,
         )
         self.action_dof = action_dof
         self.ex_num_tokens_per_latent_frame = ex_num_tokens_per_latent_frame
@@ -671,6 +723,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             self.action_t_embedder[1].init_weights()
             self.action_embedder_B_D.init_weights()
             self.action_decoder_B_D.init_weights()
+            self.action_t_embedding_norm.reset_parameters()
 
     def count_parameters(self) -> int:
         total_params = 0
@@ -722,27 +775,37 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         padding_mask: Optional[torch.Tensor] = None,
         data_type: Optional[DataType] = DataType.VIDEO,
         use_cuda_graphs: bool = False,
-        action: Optional[torch.Tensor] = None,
+        action_B_T_D: Optional[torch.Tensor] = None,  # as self-attn input rather than cross-attn kv
+        action_timesteps_B_T: Optional[torch.Tensor] = None,  # due to different mask length, this can be different from timesteps_B_T
+        condition_action_input_mask_B_T_D: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
 
+        # x_B_C_T_H_W: torch.Size([12, 16, 5*, 32, 32])
+        # Concatenate condition mask at the end of the channel dimension
         if data_type == DataType.VIDEO:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
+            action_B_T_D = torch.cat([action_B_T_D, condition_action_input_mask_B_T_D.type_as(action_B_T_D)], dim=2)
+            # print("[DEBUG] dit.forward", "cond_v_mask", condition_video_input_mask_B_C_T_H_W.shape, condition_video_input_mask_B_C_T_H_W[0],
+            #       "\ncond_a_mask", condition_action_input_mask_B_T_D.shape, condition_action_input_mask_B_T_D[0])
         else:
             B, _, T, H, W = x_B_C_T_H_W.shape
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, torch.zeros((B, 1, T, H, W), dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)], dim=1
             )
+        # x_B_C_T_H_W torch.Size([12, 17, 5*, 32, 32])
+
         # NOTE: project action to action embedding, action:(B,horizon,act_dim)
-        assert action is not None, "action must be provided"
+        assert action_B_T_D is not None, "action must be provided"
         B, C, T, _, _ = x_B_C_T_H_W.shape  # (B,16+1,4,32,32)
-        action = rearrange(action, "b t d -> b 1 (t d)")
-        action_emb_B_1_TWD = self.action_embedder_B_D(action)  # ->(B,1,T*D)
+        action_B_1_TD = rearrange(action_B_T_D, "b t d -> b 1 (t d)")
+        action_emb_B_1_TWD = self.action_embedder_B_D(action_B_1_TD)  # ->(B,1,T*D)
         action_emb_B_T_1_1_D = rearrange(
             action_emb_B_1_TWD, "b 1 (t d) -> b t 1 1 d",
-            t=T,
-        )
+            t=self.ex_num_latent_frames,
+        )  # (B,ex_num_latent_frames,1,1,ex_dim)
+        assert action_emb_B_T_1_1_D.shape[-1] == self.ex_dim, f"action_emb {action_emb_B_T_1_1_D.shape} != {self.ex_dim}"
         # action_emb_B_3D = self.action_embedder_B_3D(action)
 
         assert isinstance(
@@ -757,16 +820,22 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             fps=fps,
             padding_mask=padding_mask,
         ))
+        # print("[DEBUG] dit.embedding:",
+        #       "\nx_B_T_H_W_D", x_B_T_H_W_D.shape,
+        #       "\naction_emb_B_T_1_W_D", action_emb_B_T_1_W_D.shape)
         '''
-        x_B_T_H_W_D.shape: torch.Size([12, 4, 17, 16, 2048]) 
+        x_B_T_H_W_D torch.Size([12, 5, 16, 16, 2048]) 
+        action_emb_B_T_1_W_D torch.Size([12, 12, 1, 1, 512])
         rope_emb_L_1_1_D.shape: torch.Size([1088, 1, 1, 128]) 
         crossattn_emb.shape: torch.Size([12, 512, 1024])
         '''
 
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
+        if action_timesteps_B_T.ndim == 1:
+            action_timesteps_B_T = action_timesteps_B_T.unsqueeze(1)
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
-        action_t_embedding_B_T_D, action_adaln_lora_B_T_3D = self.action_t_embedder(timesteps_B_T)
+        action_t_embedding_B_T_D, action_adaln_lora_B_T_3D = self.action_t_embedder(action_timesteps_B_T)
 
         #### NOTE: original NVIDIA action conditioned implementation
         # # NOTE: add action embedding to the timestep embedding and adaln_lora
@@ -775,6 +844,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         #### END
 
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
+        action_t_embedding_B_T_D = self.action_t_embedding_norm(action_t_embedding_B_T_D)
 
         # for logging purpose
         affline_scale_log_info = {}
@@ -828,7 +898,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             rearrange(action_emb_B_T_1_W_D, "b t 1 w d -> b (t w d)")
         )
         action_B_Horizon_Dof = self.action_reshape(action_B_HorizonDof)  # (B, horizon, dof)
-        return x_B_C_Tt_Hp_Wp
+        return x_B_C_Tt_Hp_Wp, action_B_Horizon_Dof
 
     def prepare_embedded_sequence(
         self,
@@ -870,7 +940,9 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
             )
-        x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)  # ->(B,4,16,16,D)
+        # print("[DEBUG] dit.prepare_embedded_sequence before embed", "x_B_C_T_H_W", x_B_C_T_H_W.shape,)
+        x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)  # ([12, 18, 5, 32, 32]) -> ([12, 5, 16, 16, 2048])
+        # print("[DEBUG] dit.prepare_embedded_sequence after embed", "x_B_T_H_W_D", x_B_T_H_W_D.shape,)
         B, T, H, W, D = x_B_T_H_W_D.shape
         action_emb_B_T_1_W_D = action_emb_B_T_1_1_D.repeat(1, 1, 1, self.ex_num_tokens_per_latent_frame, 1)  # ->(B,T,1,W,D)
 

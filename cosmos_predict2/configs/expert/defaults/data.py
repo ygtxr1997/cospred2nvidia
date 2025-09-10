@@ -60,17 +60,16 @@ test_annotation_path = os.path.join(base_path, "annotation/test")
 
 pusht_train_dataset = L(PushTImageDataset)(
     # zarr_path="./datasets/pusht/pusht_cchi_v7_replay.zarr",
-zarr_path="./datasets/pusht/pusht_256.zarr",
-    horizon=12,
-    pad_before=0,
-    pad_after=8,
+    zarr_path="./datasets/pusht/pusht_256.zarr",
+    # zarr_path="./datasets/pusht/pusht_256_val.zarr",
+    max_obs=5,
+    max_act_out=12,
 )
 
 pusht_val_dataset = L(PushTImageDataset)(
     zarr_path="./datasets/pusht/pusht_orange_random_v2.zarr",
-    horizon=12,
-    pad_before=0,
-    pad_after=8,
+    max_obs=5,
+    max_act_out=12,
 )
 
 
@@ -80,7 +79,7 @@ def get_sampler(dataset):
         num_replicas=parallel_state.get_data_parallel_world_size(),
         rank=parallel_state.get_data_parallel_rank(),
         shuffle=True,
-        seed=0,
+        seed=3,  # ori:0
     )
 
 

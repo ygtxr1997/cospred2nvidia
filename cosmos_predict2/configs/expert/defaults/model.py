@@ -33,7 +33,7 @@ PREDICT2_V2W_2B_EXPERT_FSDP_CONFIG = dict(
                 dit_path="checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/model-720p-16fps.pt",  # default
                 # dit_path="checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/model-480p-10fps.pt",
                 # dit_path="checkpoints/nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned/model-480p-4fps.pt",
-                # dit_path="checkpoints/cosmos_predict2/debug/predict2_video2world_2b_action_conditioned_training_2025-08-13_04-42-41/checkpoints/model/iter_000005000.pt",
+                # dit_path="checkpoints/cosmos_predict2/debug/predict2_video2world_2b_expert_training_2025-09-09_02-14-31/checkpoints/model/iter_000024000.pt",
                 text_encoder_path="",  # Do not load text encoder for training.
             ),
             fsdp_shard_size=-1,

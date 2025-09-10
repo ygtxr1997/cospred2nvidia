@@ -521,6 +521,9 @@ class Video2WorldPipeline(BasePipeline):
                 from torchvision.transforms.v2 import UniformTemporalSubsample
                 expected_length = self.tokenizer.get_pixel_num_frames(self.config.state_t)
                 original_length = data_batch[input_key].shape[2]
+                # print("[DEBUG] normalize_video: expected_length", expected_length, "; original_shape", data_batch[input_key].shape)
+                if original_length < expected_length:
+                    print("[WARNING] Video has fewer frames than expected. Padding with last frame.")
                 if original_length != expected_length:
                     video = rearrange(data_batch[input_key], "b c t h w -> b t c h w")
                     video = UniformTemporalSubsample(expected_length)(video)

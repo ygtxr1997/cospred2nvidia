@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import attrs
+
 from cosmos_predict2.conditioner import ActionConditioner, BooleanFlag, ReMapkey, TextAttr
 from cosmos_predict2.configs.base.config_video2world import (
     ConditioningStrategy,
@@ -20,12 +22,27 @@ from cosmos_predict2.configs.base.config_video2world import (
     CosmosReason1Config,
     Video2WorldPipelineConfig,
 )
+from cosmos_predict2.configs.base.config_text2image import CosmosGuardrailConfig, SolverTimestampConfig
 from cosmos_predict2.configs.base.defaults.ema import EMAConfig
 from cosmos_predict2.models.text2image_dit import SACConfig
 # from cosmos_predict2.models.video2world_action_dit import ActionConditionedMinimalV1LVGDiT
 from cosmos_predict2.models.video2world_expert_dit import ExpertMinimalV1LVGDiT
 from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
+from imaginaire.config import make_freezable
 from imaginaire.lazy_config import LazyCall as L
+from imaginaire.lazy_config import LazyDict
+
+
+@make_freezable
+@attrs.define(slots=False)
+class Video2WorldExpertPipelineConfig(Video2WorldPipelineConfig):
+    # action related
+    input_action_key: str = "action"
+    input_agent_pos_key: str = "agent_pos"
+    max_obs: int = 5
+    max_act_out: int = 12
+    p_all_actions_as_condition: float = 0.5
+
 
 # Modified: action_conditioned/config.py PREDICT2_VIDEO2WORLD_NET_2B_ACTION_CONDITIONED
 PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
@@ -61,8 +78,8 @@ PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
     action_dim=2 * 12,  # (act_dim * horizon), ori:7*12
     # NOTE: add expert params
     action_dof=2,  # pusht: 2-DoF; robotic arm: 7-DoF;
-    ex_num_latent_frames=4,  # (B,T,1,W,D), T=num_latent_frames, can be different from video
-    ex_num_tokens_per_latent_frame=16,  # W=num_tokens_per_frame, embeddings repeat times
+    ex_num_latent_frames=12,  # (B,T,1,W,D), T=num_latent_frames, can be different from video, latent and ori action are consistent, good?
+    ex_num_tokens_per_latent_frame=1,  # W=num_tokens_per_frame, embeddings repeat times
     ex_dim=512,  # expert feature dimension, D=dim
     ex_num_heads=16,
     ex_mlp_ratio=4.0,
@@ -70,7 +87,7 @@ PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
 )
 
 # Modified: action_conditioned/config.py PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
-PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldPipelineConfig(
+PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldExpertPipelineConfig(
     adjust_video_noise=True,
     conditioner=L(ActionConditioner)(
         fps=L(ReMapkey)(
@@ -116,7 +133,7 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldPipelineConfig(
     sigma_conditional=0.0001,
     sigma_data=1.0,
     state_ch=16,
-    state_t=4,  # ori:4
+    state_t=5,  # 5=2+3, ori:4
     text_encoder_class="T5",
     tokenizer=L(TokenizerInterface)(
         chunk_duration=81,
@@ -135,4 +152,8 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldPipelineConfig(
         offload_model_to_cpu=True,
         enabled=False,
     ),
+    # action related
+    max_obs=5,
+    max_act_out=12,
+    p_all_actions_as_condition=0.,
 )

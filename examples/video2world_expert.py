@@ -31,6 +31,7 @@ from megatron.core import parallel_state
 from cosmos_predict2.configs.expert.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT
 from cosmos_predict2.pipelines.video2world_expert import Video2WorldExpertPipeline
 from cosmos_predict2.data.action_conditioned.pusht_dataset import PushTImageDataset
+from cosmos_predict2.utils.vis_helpers import save_action_as_image
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video
 
@@ -92,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         choices=[1],
-        help="Number of frames to condition on (1 for single frame, 5 for multi-frame conditioning)",
+        help="Number of frames to condition on (1 for single frame, 5 for multi-frame conditioning) (Not used)",
     )
     parser.add_argument(
         "--chunk_size",
@@ -187,17 +188,26 @@ def process_single_generation(
     pipe, input_path, output_path, guidance, seed, chunk_size, autoregressive,
     dataset_index=0, frame_index=0,
 ):
+    # chunk_action_max_len = 13 - 1  # a1=v1+v2-1, v1=1, v2=12
+    chunk_action_horizon = chunk_size  # horizon=a1+a2
+    chunk_max_obs = 5
     pusht_val_dataset = PushTImageDataset(
         zarr_path=input_path,  #"./datasets/pusht/pusht_orange_random_v2.zarr",
-        horizon=60,
-        pad_before=0,
-        pad_after=8,
+        max_obs=chunk_max_obs,  # v1 in [1,max_obs]
+        max_act_out=chunk_action_horizon * 6,  # can be much longer since we can do autoregressive generation (a1+a2)
     )
     actions, frames = get_action_sequence(pusht_val_dataset, dataset_index=dataset_index)
     # actions: (T,2), in [0,1]
     # frames: (T,H,W,C), in [0,255]
     first_frame = read_first_frame(pusht_val_dataset, dataset_index=dataset_index, frame_index=frame_index)
     # first_frame: (H,W,C), in [0,255]
+    print("[DEBUG] single_generation gt. actions.shape:", actions.shape, "frames.shape:",
+          frames.shape, "first_frame.shape:", first_frame.shape)
+    '''
+    actions.shape: (77, 2) 
+    frames.shape: (77, 256, 256, 3) 
+    first_frame.shape: (256, 256, 3)
+    '''
 
     log.info(f"Running Video2WorldPipeline\ninput: {input_path}")
 
@@ -205,22 +215,39 @@ def process_single_generation(
         log.info("Using autoregressive mode")
         video_chunks = []
         for i in range(0, len(actions), chunk_size):
-            if actions[i : i + chunk_size].shape[0] < chunk_size:
+            frame_start = i
+            frame_end = i + chunk_max_obs + chunk_size  # load all frames (including obs and gt)
+            action_start = i + chunk_max_obs - 1
+            action_end = action_start + chunk_size
+
+            print("[DEBUG] Autoregressive chunk:", i, f"video:[{frame_start},{frame_end}), action:[{action_start},{action_end})", )
+            if actions[action_start : action_end].shape[0] < chunk_size:
                 log.info("Reached end of actions")
                 break
-            video = pipe(
+
+            v, H, W, C = frames[frame_start : frame_start + chunk_max_obs].shape
+            in_frames = np.concatenate(
+                (frames[frame_start : frame_start + chunk_max_obs],
+                 np.zeros((chunk_size, H, W, C))), axis=0).astype(np.uint8)  # zero out gt frames
+            video, out_action = pipe(
                 # first_frame,
-                frames[i],
-                actions[i : i + chunk_size],
-                num_conditional_frames=1,
+                in_frames,  # a1=v1+v2-1, v1=1, v2=12
+                np.zeros_like(actions[action_start : action_end]),  # chunk_size=(v1+v2)+a2, zero out gt actions
+                num_conditional_frames=chunk_max_obs,
+                num_conditional_actions=0,  # use all actions as condition (chunk_size) or predict all actions (0)
                 guidance=guidance,
                 seed=i,
-            )  # (B,C,T,H,W), in [-1,1]
+            )  # video:(B,C,T,H,W), in [-1,1], action:(B,a1+a2,2), in [0,1]
             # first_frame = ((video[0, :, -1].permute(1, 2, 0).cpu().numpy() / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
+            # drop the last frame to avoid duplication
+            print("[DEBUG] autoregressive video.shape:", video.shape, "out_action.shape:", out_action.shape)
+            # video = video[:, :, :-1]  # (1,3,13-1,256,256)
+            save_action_as_image(out_action[0].cpu().numpy(), save_path=f"output/out_action_{i:02d}.png")
+            save_action_as_image(actions[action_start : action_end], save_path=f"output/in_action_{i:02d}.png")
             video_chunks.append(video)
         video = torch.cat([video_chunks[0]] + [chunk[:, :, :-1] for chunk in video_chunks[1:]], dim=2)
     else:
-        video = pipe(
+        video, _ = pipe(
             first_frame,
             actions[:chunk_size],
             num_conditional_frames=1,

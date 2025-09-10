@@ -41,17 +41,40 @@ predict2_video2world_2b_expert_training = dict(
     ),
     dataloader_train=dict(
         batch_size=12,
-        num_workers=18,
+        num_workers=10,
     ),
     trainer=dict(
         distributed_parallelism="fsdp",
-        max_iter=10000,
+        max_iter=40000,
+        callbacks=dict(
+            # iter_speed=dict(hit_thres=10),
+            device_monitor=dict(every_n=2000),
+            # every_n_sample_reg=L(EveryNDrawSampleMultiviewVideo)(
+            #     every_n=500,
+            #     is_x0=False,
+            #     is_ema=False,
+            #     guidance=[0, 2, 7],
+            #     num_sampling_step=35,
+            #     fps=10,
+            #     sample_n_views=len(camera_keys),
+            #     dataset_name=None,
+            # ),
+            # every_n_sample_ema=L(EveryNDrawSampleMultiviewVideo)(
+            #     every_n=500,
+            #     is_x0=False,
+            #     is_ema=True,
+            #     guidance=[0, 2, 7],
+            #     num_sampling_step=35,
+            #     fps=10,
+            #     sample_n_views=len(camera_keys),
+            #     dataset_name=None,
+            )
     ),
     checkpoint=dict(
-        save_iter=500,
+        save_iter=1000,
     ),
     optimizer=dict(
-        lr=5e-5,
+        lr=1e-4,  # or:1e-4,
     ),
 )
 

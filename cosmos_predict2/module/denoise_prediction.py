@@ -24,3 +24,12 @@ class DenoisePrediction:
     x0: torch.Tensor  # clean data prediction
     eps: Optional[torch.Tensor] = None  # noise prediction
     logvar: Optional[torch.Tensor] = None  # log variance of noise prediction, can be used a confidence / uncertainty
+
+
+@dataclass
+class DenoisePredictionWithAction:
+    x0: torch.Tensor  # clean data prediction
+    eps: Optional[torch.Tensor] = None  # noise prediction
+    logvar: Optional[torch.Tensor] = None  # log variance of noise prediction,
+    action0: torch.Tensor = None  # clean action prediction
+    action_eps: Optional[torch.Tensor] = None
