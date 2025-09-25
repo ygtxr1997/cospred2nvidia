@@ -9,7 +9,7 @@ def print_leaf(prefix, x):
         if x.ndim == 0:
             print(f'{prefix},{type(x)},shape={x.shape}, {x}')
         else:
-            print(f'{prefix},{type(x)},shape={x.shape}')
+            print(f'{prefix},{type(x)},shape={x.shape},min={float(x.min()):.4f},max={float(x.max()):.4f}')
     elif isinstance(x, bool) or isinstance(x, int):
         print(f'{prefix}:{type(x)},{x}')
     else:

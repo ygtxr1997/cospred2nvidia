@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Callable, Tuple
+from typing import Any, Dict, Callable, Tuple, Union
 
 import numpy as np
 import torch
@@ -608,7 +608,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         self,
         video: torch.Tensor,
         actions: torch.Tensor,
-        prompt: str,
+        prompt: Union[str, torch.Tensor],
         negative_prompt: str = "",
         num_latent_conditional_frames: int = 1,
         num_conditional_actions: int = 0,
@@ -623,7 +623,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
 
         Args:
             video (torch.Tensor): The input video tensor (B, C, T, H, W).
-            prompt (str): The text prompt for conditioning.
+            prompt (str or torch.Tensor): The text prompt for conditioning or precomputed text embeddings (B,512,1024)
             negative_prompt (str): Negative prompt.
             num_latent_conditional_frames (int, optional): The number of latent conditional frames. Defaults to 1.
 
@@ -632,12 +632,25 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         """
         B, C, T, H, W = video.shape
 
+        if isinstance(prompt, str) and prompt == "":
+            t5_text_embeddings = torch.zeros(1, 512, 1024, dtype=torch.bfloat16).cuda()
+        elif isinstance(prompt, str):
+            t5_text_embeddings = self.encode_prompt(prompt).to(dtype=torch.bfloat16).cuda()
+        elif isinstance(prompt, torch.Tensor):
+            t5_text_embeddings = prompt.cuda()  # (1, 512, 1024)
+        else:
+            raise NotImplementedError("prompt must be a string or a tensor of shape (B, 512, 1024)")
+
+        print(f"[DEBUG] ({prompt if isinstance(prompt, str) else prompt.shape}) "
+              f"t5_text_embeddings:", t5_text_embeddings.shape, t5_text_embeddings.dtype,
+              t5_text_embeddings.min(), t5_text_embeddings.max())
+
         self.batch_size = B  # ori:1
         data_batch = {
             "dataset_name": "video_data",
             "video": video,
             # NOTE: we don't use text embeddings for action conditional video2world
-            "t5_text_embeddings": torch.zeros(self.batch_size, 512, 1024, dtype=torch.bfloat16).cuda(),
+            "t5_text_embeddings": t5_text_embeddings.repeat(self.batch_size, 1, 1),
             "fps": torch.ones(self.batch_size) * 10,  # ori:torch.randint(16, 32, (self.batch_size,)),  # Random FPS (might be used by model)
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_latent_conditional_frames,  # ori:num_latent_conditional_frames,  # Specify number of conditional frames
@@ -661,7 +674,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         self,
         first_frame: np.ndarray,  # (v1+v2,H,W,C), in [0,255], uint8
         actions: np.ndarray,  # (a1+a2,D), in [-1,1], float32
-        prompt: str = "",
+        prompt: Union[str, torch.Tensor] = "",  # text prompt or text embeddings
         negative_prompt: str = "",
         num_conditional_frames: int = 5,
         num_conditional_actions: int = 0,
@@ -697,6 +710,15 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)  # (B,a1+a2,D)
             assert vid_input.shape[0] == actions_tensor.shape[0], "first_frame and actions must have the same batch size"
 
+        # Check prompt type, if it is a tensor, it must be of shape (512, 1024)
+        if isinstance(prompt, torch.Tensor):
+            assert prompt.ndim == 2 and prompt.shape[0] == 512 and prompt.shape[1] == 1024, \
+                "If prompt is a tensor, it must be of shape (B, 512, 1024)"
+            assert prompt.dtype == torch.bfloat16, "If prompt is a tensor, it must be of dtype torch.bfloat16"
+            prompt = prompt.unsqueeze(0)  # (1, 512, 1024)
+        elif isinstance(prompt, str):
+            pass
+
         # Prepare the data batch with text embeddings
         data_batch = self._get_data_batch_input(
             vid_input,
@@ -717,6 +739,16 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         padding_mask,<class 'torch.Tensor'>,shape=torch.Size([1, 1, 256, 256])
         num_conditional_frames:<class 'int'>,1
         action,<class 'torch.Tensor'>,shape=torch.Size([1, 24, 2])
+        LIBERO:
+        [Video2WorldExpertPipeline] data_batch: Dict,keys=dict_keys(['dataset_name', 'video', 't5_text_embeddings', 'fps', 'padding_mask', 'num_conditional_frames', 'num_conditional_actions', 'action'])
+        dataset_name:<class 'str'>,len=10
+        video,<class 'torch.Tensor'>,shape=torch.Size([1, 3, 33, 128, 128]),min=0.0000,max=255.0000
+        t5_text_embeddings,<class 'torch.Tensor'>,shape=torch.Size([1, 512, 1024]),min=-0.7461,max=0.6172
+        fps,<class 'torch.Tensor'>,shape=torch.Size([1]),min=10.0000,max=10.0000
+        padding_mask,<class 'torch.Tensor'>,shape=torch.Size([1, 1, 128, 128]),min=0.0000,max=0.0000
+        num_conditional_frames:<class 'int'>,3
+        num_conditional_actions:<class 'int'>,0
+        action,<class 'torch.Tensor'>,shape=torch.Size([1, 24, 10]),min=0.0000,max=0.0000
         '''
 
         # preprocess
@@ -831,7 +863,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         # Decode
         video = self.decode(samples)  # shape: (B, C, T, H, W), possibly out of [-1, 1]
         step_action = samples_a  # (B, Ta, Da), in [-1,1]
-        print("[DEBUG] pipeline.__call__ video", video.shape, video.min(), video.max(),
+        print("[DEBUG] pipeline.__call__ out video", video.shape, video.min(), video.max(),
               "step_action", step_action.shape, step_action.min(), step_action.max(),)
 
         # Run video guardrail on the generated video and apply postprocessing

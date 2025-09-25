@@ -35,7 +35,7 @@ LAST_OUT_ACTION = None
 
 COSMOS_ROOT="/home/geyuan/code/cospred2nvidia"
 MODEL_TIME = "2025-09-09_22-33-33"
-ITERATION = "000025000"
+ITERATION = "000040000"
 #INPUT_DATASET_PATH="./datasets/pusht/pusht_cchi_v7_replay.zarr"
 #INPUT_DATASET_PATH="./datasets/pusht/pusht_orange_random_v2.zarr"
 INPUT_DATASET_PATH = f"{COSMOS_ROOT}/datasets/pusht/pusht_256_val.zarr"
@@ -272,7 +272,7 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
         )
 
 
-        # Stage II. Frames+Actions -> Frames
+        # # Stage II. Frames+Actions -> Frames
         # in_frames = in_frames
         # in_actions = out_action.cpu().numpy()  # (B,a1,2) float32, in [-1,1]
         # out_video, _ = agent(
@@ -283,6 +283,11 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
         #     guidance=args.guidance,
         #     seed=args.seed,
         # )  # out_video:(B,chunk_size,H,W,3) float32 in [-1,1]
+        # save_image_or_video(
+        #     out_video,
+        #     f"output/pusht_expert_pred2_{ITERATION}.mp4",
+        #     fps=5
+        # )
 
         out_action = torch.clamp(out_action, min=-1., max=1.)
         out_action = (out_action * 256. + 256.).cpu().numpy()  # in [0,512]
@@ -306,7 +311,7 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
             seed=args.seed,
         )
         out_action = out_action[:, a1:, :]  # (B,a2,2) float32
-        out_action = (out_action * 512.0).cpu().numpy()  # in [0,512]
+        out_action = (out_action * 512.0).cpu().numpy()  # in [0,512], for pusht
         assert out_action.shape[:-1] == (B, max_cache_action), f"Only support out_action.shape=(B,{max_cache_action},2), got {out_action.shape}"
 
         # save the generated video for debug

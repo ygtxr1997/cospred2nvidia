@@ -99,6 +99,8 @@ class LiberoReplayImageDataset(BaseImageDataset):
             language_emb_model=None,
             data_aug=False,
             normalizer_type=None,
+            # extra args for cache building,
+            cache_zarr_path: str = None
     ):
         """
 
@@ -141,7 +143,13 @@ class LiberoReplayImageDataset(BaseImageDataset):
         if use_cache:
 
             if language_emb_model == "clip":
-                cache_zarr_path = dataset_path + "_clip.zarr.zip"
+                cache_zarr_path = cache_zarr_path or dataset_path + "_clip.zarr.zip"
+                assert cache_zarr_path.endswith("_clip.zarr.zip"), \
+                    "cache path must end with _clip.zarr.zip for clip model"
+            elif language_emb_model == "t5xxl":
+                cache_zarr_path = cache_zarr_path or dataset_path + "_clip_t5xxl.zarr.zip"
+                assert cache_zarr_path.endswith("_clip_t5xxl.zarr.zip"), \
+                    "cache path must end with _clip_t5xxl.zarr.zip for t5xxl model"
             else:
                 raise NotImplementedError(f"Language model {language_emb_model} not implemented")
 
@@ -151,7 +159,7 @@ class LiberoReplayImageDataset(BaseImageDataset):
 
             with FileLock(cache_lock_path):
                 if not os.path.exists(cache_zarr_path):
-                    # cache does not exists
+                    # cache does not exist, create a new one
                     try:
                         print("Cache does not exist. Creating!")
 
@@ -224,7 +232,32 @@ class LiberoReplayImageDataset(BaseImageDataset):
         self.pad_after = pad_after
         self.use_legacy_normalizer = use_legacy_normalizer
 
+        stat = array_to_stats(self.replay_buffer["action"])
+        self.meta_action_mean = torch.from_numpy(stat["mean"])
+        self.meta_action_std = torch.from_numpy(stat["std"])
+        self.meta_action_min = torch.from_numpy(stat["min"])
+        self.meta_action_max = torch.from_numpy(stat["max"])
+        print("[LiberoDataset] action: "
+              "\nmean:", ",\t".join(f"{x:.4f}" for x in self.meta_action_mean),
+              "\nstd:", ",\t".join(f"{x:.4f}" for x in self.meta_action_std),
+              "\nmin:", ",\t".join(f"{x:.4f}" for x in self.meta_action_min),
+              "\nmax:", ",\t".join(f"{x:.4f}" for x in self.meta_action_max),)
+        '''
+        mean: -0.0410,	0.0349,	0.8389,	0.3086,	0.6320,	-0.0298,	0.6294,	-0.2721,	0.1521,	-0.1065 
+        std: 0.1048,	0.1465,	0.2572,	0.5414,	0.4351,	0.1485,	0.4493,	0.4955,	0.2436,	0.9941 
+        min: -0.5226,	-0.3341,	0.4075,	-1.0000,	-0.7127,	-0.6373,	-0.8550,	-1.0000,	-0.6161,	-1.0000 
+        max: 0.2064,	0.3886,	1.3320,	1.0000,	1.0000,	0.6735,	1.0000,	0.9999,	0.9838,	1.0000
+        '''
+
         self.language_emb_model = language_emb_model
+        if "t5xxl" in self.language_emb_model:
+            self.t5_meta = {
+                "unique_embeddings": self.replay_buffer.meta["t5_unique_embeddings"],
+                "unique_valid_lengths": self.replay_buffer.meta["t5_valid_lengths"],
+                "unique_texts": self.replay_buffer.meta["t5_unique_texts"],
+            }
+            print(f"[LiberoDataset] using t5xxl model for language embedding. "
+                  f"found {len(self.t5_meta['unique_embeddings'])} unique texts")
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -242,7 +275,7 @@ class LiberoReplayImageDataset(BaseImageDataset):
         normalizer = LinearNormalizer()
 
         # action
-        stat = array_to_stats(self.replay_buffer["action"])
+        stat = array_to_stats(self.replay_buffer["action"])  # (N,D) -> {'min':(D,), ..., 'std':(D,)}
         if self.abs_action:
             if stat["mean"].shape[-1] > 10:
                 # dual arm
@@ -284,12 +317,35 @@ class LiberoReplayImageDataset(BaseImageDataset):
     def get_all_actions(self) -> torch.Tensor:
         return torch.from_numpy(self.replay_buffer["action"])
 
+    def norm_action(self, action: torch.Tensor) -> torch.Tensor:
+        return (action - self.meta_action_mean) / self.meta_action_std
+
+    def denorm_action(self, action: torch.Tensor) -> torch.Tensor:
+        raw_action = action * self.meta_action_std + self.meta_action_mean  # gripper: [-1,1]
+
+        raw_action = torch.clamp(
+            raw_action,
+            min=self.meta_action_min,
+            max=self.meta_action_max
+        )
+
+        # binarize gripper
+        raw_action[..., -1] = (raw_action[..., -1] > 0).float() * 2. - 1.  # to {-1,1}
+        return raw_action
+
     def __len__(self):
         return len(self.sampler)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         threadpool_limits(1)
         data = self.sampler.sample_sequence(idx)
+        '''
+        sampled: Dict,keys=dict_keys(['action', 'agentview_rgb', 'language', 't5_text_indices'])
+        action,<class 'numpy.ndarray'>,shape=(33, 10),min=-1.0000,max=0.9999
+        agentview_rgb,<class 'numpy.ndarray'>,shape=(33, 128, 128, 3),min=0.0000,max=248.0000
+        language,<class 'numpy.ndarray'>,shape=(33, 2, 30),min=0.0000,max=49407.0000
+        t5_text_indices,<class 'numpy.ndarray'>,shape=(33,),min=0.0000,max=0.0000
+        '''
 
         obs_dict = dict()
         for key in self.rgb_keys:
@@ -326,6 +382,34 @@ class LiberoReplayImageDataset(BaseImageDataset):
             "obs": dict_apply(obs_dict, torch.from_numpy),
             "action": torch.from_numpy(data["action"].astype(np.float32)),
         }
+        # in_action = torch_data["action"]
+        # print("in_action:",
+        #       "\ndim0:", in_action[:, 0].min(), in_action[:, 0].max(),
+        #       "\ndim1:", in_action[:, 1].min(), in_action[:, 1].max(),
+        #       "\ndim2:", in_action[:, 2].min(), in_action[:, 2].max(),
+        #       "\ndim3:", in_action[:, 3].min(), in_action[:, 3].max(),
+        #       "\ndim4:", in_action[:, 4].min(), in_action[:, 4].max(),
+        #       "\ndim5:", in_action[:, 5].min(), in_action[:, 5].max(),
+        #       "\ndim6:", in_action[:, 6].min(), in_action[:, 6].max(),
+        #       "\ndim7:", in_action[:, 7].min(), in_action[:, 7].max(),
+        #       "\ndim8:", in_action[:, 8].min(), in_action[:, 8].max(),
+        #       "\ndim9:", in_action[:, 9].min(), in_action[:, 9].max(),
+        #       )
+
+        nactions = self.norm_action(torch_data["action"])
+        # in_action = nactions
+        # print("nactions:",
+        #       "\ndim0:", in_action[:, 0].min(), in_action[:, 0].max(),
+        #       "\ndim1:", in_action[:, 1].min(), in_action[:, 1].max(),
+        #       "\ndim2:", in_action[:, 2].min(), in_action[:, 2].max(),
+        #       "\ndim3:", in_action[:, 3].min(), in_action[:, 3].max(),
+        #       "\ndim4:", in_action[:, 4].min(), in_action[:, 4].max(),
+        #       "\ndim5:", in_action[:, 5].min(), in_action[:, 5].max(),
+        #       "\ndim6:", in_action[:, 6].min(), in_action[:, 6].max(),
+        #       "\ndim7:", in_action[:, 7].min(), in_action[:, 7].max(),
+        #       "\ndim8:", in_action[:, 8].min(), in_action[:, 8].max(),
+        #       "\ndim9:", in_action[:, 9].min(), in_action[:, 9].max(),
+        #       )
         '''
         sample: Dict,keys=dict_keys(['obs', 'action'])
         obs: Dict,keys=dict_keys(['agentview_rgb', 'language'])
@@ -333,7 +417,39 @@ class LiberoReplayImageDataset(BaseImageDataset):
         -language,<class 'torch.Tensor'>,shape=torch.Size([32, 2, 30]),min=0.0000,max=49407.0000
         action,<class 'torch.Tensor'>,shape=torch.Size([32, 10]),min=-1.0000,max=0.9999
         '''
-        return torch_data
+
+        ''' Get t5 embeddings '''
+        if "t5" in self.language_emb_model:
+            assert "t5_text_indices" in data, "t5_text_indices not found in data"
+            t5_text_indices = data["t5_text_indices"]  # (T,)
+            t5_text_embeddings = torch.from_numpy(
+                self.t5_meta["unique_embeddings"][t5_text_indices][0]
+            ).to(torch.bfloat16)  # (T[0],512,1024), only 1 unique text in a clip
+        else:
+            t5_text_embeddings = torch.zeros(512, 1024, dtype=torch.bfloat16)
+
+        ''' Remap keys to match the cosmos-predict2 output format '''
+        ret_video = (torch_data['obs']['agentview_rgb'].permute(1, 0, 2, 3) * 255.
+                     ).to(torch.uint8)  # (C,T,H,W) in [0,255]
+        ret_agent_pos = torch.zeros((self.horizon, 7), dtype=torch.float32)  # (T,7)
+        remapped_data = {
+            "action": nactions,  # (horizon,10), normalized by (x-mean)/std ~[-1,1]
+            "video": ret_video,  # (3,T,128,128), [0,255] torch.uint8
+            "agent_pos": ret_agent_pos,  # (T,2), [-1,1]
+            "annotation_file": "None",
+            "__key__": "None",
+            "t5_text_embeddings": t5_text_embeddings,
+            "t5_text_mask": torch.ones(512, dtype=torch.int64),  # although embeddings have zero vectors, mask is all 1
+            "fps": 10,
+            "image_size": torch.tensor([
+                128, 128, 128, 128
+            ]),
+            "num_frames": ret_video.shape[1],  # v_cond (+v_out)
+            "padding_mask": torch.zeros(1, 128, 128),  # (T,H,W) not used; cond mask is set in conditioner
+            # "num_conditional_frames": n_v_cond,  # different across in a single batch
+            # "num_conditional_actions": n_a_cond,
+        }
+        return remapped_data
 
 
 def _convert_actions(raw_actions, abs_action, rotation_transformer):
@@ -400,6 +516,46 @@ def _convert_robomimic_to_replay(
         raise NotImplementedError(f"Language model {language_emb_model} not implemented")
 
     dataset_paths = glob.glob(dataset_path + "/*.hdf5")
+    print("dataset paths:", "\n".join(dataset_paths))
+    '''
+    uva text: [
+    'living room scene 2 put both the cream cheese box and the butter in the basket'
+    'living room scene 6 put the white mug on the plate and put the chocolate pudding to the right of the plate'
+    'kitchen scene 8 put both moka pots on the stove'
+    'kitchen scene 3 turn on the stove and put the moka pot on it'
+    'kitchen scene 6 put the yellow and white mug in the microwave and close it'
+    'living room scene 1 put both the alphabet soup and the cream cheese box in the basket'
+    'kitchen scene 4 put the black bowl in the bottom drawer of the cabinet and close it'
+    'living room scene 5 put the white mug on the left plate and put the yellow and white mug on the right plate'
+    'living room scene 2 put both the alphabet soup and the tomato sauce in the basket'
+    'study scene 1 pick up the book and place it in the back compartment of the caddy'
+    ]
+    dataset paths: [
+    'KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_demo.hdf5', 
+    'STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_demo.hdf5', 
+    'KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it_demo.hdf5', 
+    'LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket_demo.hdf5', 
+    'KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo.hdf5', 
+    'LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate_demo.hdf5', 
+    'LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket_demo.hdf5', 
+    'LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate_demo.hdf5', 
+    'KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5', 
+    'LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket_demo.hdf5']
+    '''
+    uva_order = {
+        "LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket_demo.hdf5": 0,
+        "LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate_demo.hdf5": 1,
+        "KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_demo.hdf5": 2,
+        "KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo.hdf5": 3,
+        "KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it_demo.hdf5": 4,
+        "LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket_demo.hdf5": 5,
+        "KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5": 6,
+        "LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate_demo.hdf5": 7,
+        "LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket_demo.hdf5": 8,
+        "STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_demo.hdf5": 9,
+    }
+    dataset_paths = sorted(dataset_paths, key=lambda x: uva_order[x.split("/")[-1]])
+    print("[DEBUG] use uva order for dataset paths:", "\n".join(dataset_paths))
 
     for dataset_path_each in dataset_paths:
         language_goal = " ".join(dataset_path_each.split("/")[-1][:-10].split("_"))

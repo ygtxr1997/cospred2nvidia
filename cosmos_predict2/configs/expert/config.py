@@ -155,5 +155,5 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldExpertPipelineConfig(
     # action related
     max_obs=5,
     max_act_out=12,
-    p_all_actions_as_condition=0.,
+    p_all_actions_as_condition=0.3,
 )

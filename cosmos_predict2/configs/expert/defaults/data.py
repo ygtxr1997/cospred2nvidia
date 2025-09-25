@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from cosmos_predict2.data.action_conditioned.action_conditioned_dataset import ActionConditionedDataset
 from cosmos_predict2.data.action_conditioned.pusht_dataset import PushTImageDataset
+from cosmos_predict2.data.action_conditioned.libero_dataset import LiberoReplayImageDataset
 from imaginaire.lazy_config import LazyCall as L
 
 base_path = "./datasets/bridge/"
@@ -73,6 +74,42 @@ pusht_val_dataset = L(PushTImageDataset)(
 )
 
 
+libero_train_dataset = L(LiberoReplayImageDataset)(
+    shape_meta={
+        "image_resolution": 128,
+        "action": {
+            "shape": [10]
+        },
+        "obs": {
+            "agentview_rgb": {
+                "shape": [3, 128, 128],
+                "type": "rgb"
+            },
+            "language": {
+                "shape": [15],
+            }
+        }
+    },
+    dataset_path="/home/geyuan/datasets/LIBERO_uva25rss/libero_10",
+    horizon=33,  # max length of each clip
+    pad_before=4 * 2,  # m_obs-1
+    pad_after=1,
+    n_obs_steps=4 * 2 + 1,  # not used
+    abs_action=True,
+    rotation_rep="rotation_6d",
+    use_cache=True,
+    seed=42,
+    val_ratio=0.0,  # ori:0.02
+    language_emb_model="t5xxl",  # ori: "clip"
+    data_aug=True,
+    normalizer_type="all",  # not used
+    # TODO: full dataset
+    cache_zarr_path="/home/geyuan/datasets/LIBERO_uva25rss/libero_10_full_clip_t5xxl.zarr.zip",
+)
+
+libero_val_dataset = libero_train_dataset
+
+
 def get_sampler(dataset):
     return DistributedSampler(
         dataset,
@@ -100,6 +137,23 @@ bridge_val_dataloader = L(DataLoader)(
 )
 
 
+libero_train_dataloader = L(DataLoader)(
+    dataset=libero_train_dataset,
+    sampler=L(get_sampler)(dataset=libero_train_dataset),
+    batch_size=4,  # ori: 1
+    drop_last=True,
+    num_workers=8,
+    pin_memory=True,
+)
+
+libero_val_dataloader = L(DataLoader)(
+    dataset=libero_val_dataset,
+    sampler=L(get_sampler)(dataset=libero_val_dataset),
+    batch_size=1,
+    drop_last=True,
+)
+
+
 def register_training_and_val_data_expert():
     cs = ConfigStore.instance()
 
@@ -115,4 +169,17 @@ def register_training_and_val_data_expert():
         package="dataloader_val",
         name="pusht_val",
         node=bridge_val_dataloader,
+    )
+
+    cs.store(
+        group="dataloader_train",
+        package="dataloader_train",
+        name="libero_train",
+        node=libero_train_dataloader,
+    )
+    cs.store(
+        group="dataloader_val",
+        package="dataloader_val",
+        name="libero_val",
+        node=libero_val_dataloader,
     )
