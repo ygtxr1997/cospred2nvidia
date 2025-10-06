@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Tuple, Union
 import concurrent.futures
 import multiprocessing
 import zarr
@@ -82,6 +82,11 @@ class BaseImageDataset(torch.utils.data.Dataset):
 
 
 class LiberoReplayImageDataset(BaseImageDataset):
+    VIEW_CHOICES = ["agentview_rgb", "eye_in_hand_rgb",]
+    CAMERA_TO_VIEW_ID = {
+        "agentview_rgb": 0,
+        "eye_in_hand_rgb": 1,
+    }
     def __init__(
             self,
             shape_meta: dict,
@@ -100,7 +105,10 @@ class LiberoReplayImageDataset(BaseImageDataset):
             data_aug=False,
             normalizer_type=None,
             # extra args for cache building,
-            cache_zarr_path: str = None
+            cache_zarr_path: str = None,
+            # multi-view related
+            camera_keys: Union[List[str], Tuple[str]] = ("agentview_rgb",),  # each in `agentview_rgb`, `eye_in_hand_rgb`
+            p_camera_drop: float = 0.0,
     ):
         """
 
@@ -135,6 +143,9 @@ class LiberoReplayImageDataset(BaseImageDataset):
             data_aug: True
             normalizer_type: all  # not used
         """
+        for camera_key in camera_keys:
+            assert camera_key in self.VIEW_CHOICES, f"camera_key must be in {self.VIEW_CHOICES}"
+
         rotation_transformer = RotationTransformer(
             from_rep="axis_angle", to_rep=rotation_rep
         )
@@ -228,6 +239,7 @@ class LiberoReplayImageDataset(BaseImageDataset):
         self.n_obs_steps = n_obs_steps
         self.train_mask = train_mask
         self.horizon = horizon
+        self.state_t = 1 + (horizon - 1) // 4  # 33->9, 17->5
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.use_legacy_normalizer = use_legacy_normalizer
@@ -248,6 +260,57 @@ class LiberoReplayImageDataset(BaseImageDataset):
         min: -0.5226,	-0.3341,	0.4075,	-1.0000,	-0.7127,	-0.6373,	-0.8550,	-1.0000,	-0.6161,	-1.0000 
         max: 0.2064,	0.3886,	1.3320,	1.0000,	1.0000,	0.6735,	1.0000,	0.9999,	0.9838,	1.0000
         '''
+        self.has_joint_states = "joint_states" in self.replay_buffer
+        if self.has_joint_states:
+            joint_states_stat = array_to_stats(self.replay_buffer["joint_states"])
+            # print("[LiberoDataset] joint_states: "
+            #       "\nmean:", ",\t".join(f"{x:.4f}" for x in joint_states_stat["mean"]),
+            #       "\nstd:", ",\t".join(f"{x:.4f}" for x in joint_states_stat["std"]),
+            #       "\nmin:", ",\t".join(f"{x:.4f}" for x in joint_states_stat["min"]),
+            #       "\nmax:", ",\t".join(f"{x:.4f}" for x in joint_states_stat["max"]),)
+            self.meta_joint_mean = torch.from_numpy(joint_states_stat["mean"])
+            self.meta_joint_std = torch.from_numpy(joint_states_stat["std"])
+            '''
+            [LiberoDataset] joint_states: 
+            mean: -0.0092,	0.3708,	0.0358,	-2.0189,	0.1920,	2.3045,	1.1149 
+            std: 0.1234,	0.3207,	0.1815,	0.4222,	0.3866,	0.3434,	0.7641 
+            min: -0.6023,	-0.7310,	-0.4286,	-3.0736,	-1.2465,	0.9248,	-2.0455 
+            max: 0.5995,	1.6696,	0.9495,	-0.0662,	2.9000,	3.7689,	2.8993
+            '''
+
+            # If joint_states is available, we here assume `ee_states` and `gripper_states` are also available
+            ee_states_stat = array_to_stats(self.replay_buffer["ee_states"])
+            self.meta_ee_states_mean = torch.from_numpy(ee_states_stat["mean"])
+            self.meta_ee_states_std = torch.from_numpy(ee_states_stat["std"])
+
+            gripper_states_stat = array_to_stats(self.replay_buffer["gripper_states"])
+            self.meta_gripper_states_mean = torch.from_numpy(gripper_states_stat["mean"])
+            self.meta_gripper_states_std = torch.from_numpy(gripper_states_stat["std"])
+            # print("[LiberoDataset] ee_states: "
+            #       "\nmean:", ",\t".join(f"{x:.4f}" for x in ee_states_stat["mean"]),
+            #       "\nstd:", ",\t".join(f"{x:.4f}" for x in ee_states_stat["std"]),
+            #       "\nmin:", ",\t".join(f"{x:.4f}" for x in ee_states_stat["min"]),
+            #       "\nmax:", ",\t".join(f"{x:.4f}" for x in ee_states_stat["max"]),)
+            # print("[LiberoDataset] gripper_states: "
+            #       "\nmean:", ",\t".join(f"{x:.4f}" for x in gripper_states_stat["mean"]),
+            #       "\nstd:", ",\t".join(f"{x:.4f}" for x in gripper_states_stat["std"]),
+            #       "\nmin:", ",\t".join(f"{x:.4f}" for x in gripper_states_stat["min"]),
+            #       "\nmax:", ",\t".join(f"{x:.4f}" for x in gripper_states_stat["max"]),)
+            '''
+            [LiberoDataset] ee_states: 
+            mean: -0.0416,	0.0326,	0.8413,	2.8851,	-0.6716,	-0.1957 
+            std: 0.1045,	0.1442,	0.2571,	0.3585,	1.2720,	0.3817 
+            min: -0.4813,	-0.3363,	0.4456,	1.0537,	-3.6578,	-2.0025 
+            max: 0.2067,	0.3914,	1.3317,	3.8439,	3.6063,	1.3686
+            [LiberoDataset] gripper_states: 
+            mean: 0.0284,	-0.0287 
+            std: 0.0133,	0.0132 
+            min: -0.0020,	-0.0412 
+            max: 0.0428,	0.0014
+            '''
+            print(f"[LiberoDataset] Found joint_states({self.replay_buffer['joint_states'].shape}), "
+                  f"ee_states({self.replay_buffer['ee_states'].shape}), "
+                  f"gripper_states({self.replay_buffer['gripper_states'].shape}) in the replay buffer. ")
 
         self.language_emb_model = language_emb_model
         if "t5xxl" in self.language_emb_model:
@@ -257,7 +320,11 @@ class LiberoReplayImageDataset(BaseImageDataset):
                 "unique_texts": self.replay_buffer.meta["t5_unique_texts"],
             }
             print(f"[LiberoDataset] using t5xxl model for language embedding. "
-                  f"found {len(self.t5_meta['unique_embeddings'])} unique texts")
+                  f"found {len(self.t5_meta['unique_embeddings'])} unique texts.")
+
+        self.camera_keys = camera_keys
+        self.p_camera_drop = p_camera_drop
+        print("[LiberoDataset] camera_keys:", self.camera_keys, ", p_camera_drop:", self.p_camera_drop)
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -333,6 +400,26 @@ class LiberoReplayImageDataset(BaseImageDataset):
         raw_action[..., -1] = (raw_action[..., -1] > 0).float() * 2. - 1.  # to {-1,1}
         return raw_action
 
+    def norm_agent_pos(self, agent_pos: torch.Tensor) -> torch.Tensor:
+        assert self.has_joint_states, "joint_states not available in the dataset"
+        assert agent_pos.shape[-1] == 8, f"agent_pos should have 8 dims, got {agent_pos.shape[-1]}"
+        joint_states = agent_pos[..., :7]  # (T,7)
+        gripper_states = agent_pos[..., 7:]  # (T,1)
+        normed_gripper_states = (gripper_states - self.meta_gripper_states_mean[0]) / self.meta_gripper_states_std[0]
+        normed_joint_states = (joint_states - self.meta_joint_mean) / self.meta_joint_std
+        normed_agent_pos = torch.cat([normed_joint_states, normed_gripper_states], dim=-1)
+        return normed_agent_pos
+
+    def denorm_agent_pos(self, agent_pos: torch.Tensor) -> torch.Tensor:
+        assert self.has_joint_states, "joint_states not available in the dataset"
+        assert agent_pos.shape[-1] == 8, f"agent_pos should have 8 dims, got {agent_pos.shape[-1]}"
+        joint_states = agent_pos[..., :7]  # (T,7)
+        gripper_states = agent_pos[..., 7:]  # (T,1)
+        denormed_gripper_states = gripper_states * self.meta_gripper_states_std[0] + self.meta_gripper_states_mean[0]
+        denormed_joint_states = joint_states * self.meta_joint_std + self.meta_joint_mean
+        denormed_agent_pos = torch.cat([denormed_joint_states, denormed_gripper_states], dim=-1)
+        return denormed_agent_pos
+
     def __len__(self):
         return len(self.sampler)
 
@@ -340,11 +427,14 @@ class LiberoReplayImageDataset(BaseImageDataset):
         threadpool_limits(1)
         data = self.sampler.sample_sequence(idx)
         '''
-        sampled: Dict,keys=dict_keys(['action', 'agentview_rgb', 'language', 't5_text_indices'])
-        action,<class 'numpy.ndarray'>,shape=(33, 10),min=-1.0000,max=0.9999
-        agentview_rgb,<class 'numpy.ndarray'>,shape=(33, 128, 128, 3),min=0.0000,max=248.0000
+        replay_sample: Dict,keys=dict_keys(['action', 'agentview_rgb', 'ee_states', 'eye_in_hand_rgb', 'gripper_states', 'joint_states', 'language'])
+        action,<class 'numpy.ndarray'>,shape=(33, 10),min=-1.0000,max=0.9993
+        agentview_rgb,<class 'numpy.ndarray'>,shape=(33, 128, 128, 3),min=0.0000,max=251.0000
+        ee_states,<class 'numpy.ndarray'>,shape=(33, 6),min=-0.3174,max=3.2354
+        eye_in_hand_rgb,<class 'numpy.ndarray'>,shape=(33, 128, 128, 3),min=0.0000,max=197.0000
+        gripper_states,<class 'numpy.ndarray'>,shape=(33, 2),min=-0.0396,max=0.0397
+        joint_states,<class 'numpy.ndarray'>,shape=(33, 7),min=-2.4466,max=2.3973
         language,<class 'numpy.ndarray'>,shape=(33, 2, 30),min=0.0000,max=49407.0000
-        t5_text_indices,<class 'numpy.ndarray'>,shape=(33,),min=0.0000,max=0.0000
         '''
 
         obs_dict = dict()
@@ -358,7 +448,22 @@ class LiberoReplayImageDataset(BaseImageDataset):
             del data[key]
 
         if self.data_aug:
-            image_tensor = torch.tensor(obs_dict["agentview_rgb"], dtype=torch.float32)
+            # (T,H,W,C)
+            image_tensors = []
+            T, H, W, C = -1, -1, -1, -1
+            for camera_key in self.camera_keys:
+                assert camera_key in obs_dict, f"camera_key {camera_key} not in obs_dict {obs_dict.keys()}"
+                # combine static and gripper view for consistent augmentation
+                image_tensor = torch.tensor(obs_dict[camera_key], dtype=torch.float32)  # (T,C,H,W)
+                if len(image_tensors) == 0:
+                    T, H, W, C = image_tensor.shape
+                else:  # check shape
+                    assert image_tensor.shape == (T, H, W, C), \
+                        f"image shape mismatch: {image_tensor.shape} vs {(T, H, W, C)}"
+                image_tensors.append(image_tensor)
+
+            # image_tensor = torch.tensor(obs_dict["agentview_rgb"], dtype=torch.float32)
+            image_tensor = torch.cat(image_tensors, dim=0)
             video_seed = torch.randint(0, 10000, (1,)).item()
 
             def consistent_augmentations(frame):
@@ -375,48 +480,33 @@ class LiberoReplayImageDataset(BaseImageDataset):
 
             augmented_images = torch.stack(
                 [consistent_augmentations(frame) for frame in image_tensor]
-            )
-            obs_dict["agentview_rgb"] = augmented_images.numpy()
+            )  # NOTE: is this fast enough?
+            augmented_images = augmented_images.chunk(len(self.camera_keys), dim=0)
+            drop_mask: np.ndarray = np.random.rand(len(self.camera_keys)) < self.p_camera_drop
+            if drop_mask.all():
+                drop_mask[np.random.randint(len(drop_mask))] = False  # ensure at least one view is kept
+            for idx, camera_key in enumerate(self.camera_keys):
+                if drop_mask[idx]:
+                    obs_dict[camera_key] = np.zeros((T, H, W, C), dtype=np.float32)
+                else:
+                    obs_dict[camera_key] = augmented_images[idx].numpy()
+                assert obs_dict[camera_key].shape == (T, H, W, C), \
+                    f"after augmentation, {camera_key} image shape mismatch: {obs_dict[camera_key].shape}"
 
         torch_data = {
             "obs": dict_apply(obs_dict, torch.from_numpy),
             "action": torch.from_numpy(data["action"].astype(np.float32)),
         }
-        # in_action = torch_data["action"]
-        # print("in_action:",
-        #       "\ndim0:", in_action[:, 0].min(), in_action[:, 0].max(),
-        #       "\ndim1:", in_action[:, 1].min(), in_action[:, 1].max(),
-        #       "\ndim2:", in_action[:, 2].min(), in_action[:, 2].max(),
-        #       "\ndim3:", in_action[:, 3].min(), in_action[:, 3].max(),
-        #       "\ndim4:", in_action[:, 4].min(), in_action[:, 4].max(),
-        #       "\ndim5:", in_action[:, 5].min(), in_action[:, 5].max(),
-        #       "\ndim6:", in_action[:, 6].min(), in_action[:, 6].max(),
-        #       "\ndim7:", in_action[:, 7].min(), in_action[:, 7].max(),
-        #       "\ndim8:", in_action[:, 8].min(), in_action[:, 8].max(),
-        #       "\ndim9:", in_action[:, 9].min(), in_action[:, 9].max(),
-        #       )
 
-        nactions = self.norm_action(torch_data["action"])
-        # in_action = nactions
-        # print("nactions:",
-        #       "\ndim0:", in_action[:, 0].min(), in_action[:, 0].max(),
-        #       "\ndim1:", in_action[:, 1].min(), in_action[:, 1].max(),
-        #       "\ndim2:", in_action[:, 2].min(), in_action[:, 2].max(),
-        #       "\ndim3:", in_action[:, 3].min(), in_action[:, 3].max(),
-        #       "\ndim4:", in_action[:, 4].min(), in_action[:, 4].max(),
-        #       "\ndim5:", in_action[:, 5].min(), in_action[:, 5].max(),
-        #       "\ndim6:", in_action[:, 6].min(), in_action[:, 6].max(),
-        #       "\ndim7:", in_action[:, 7].min(), in_action[:, 7].max(),
-        #       "\ndim8:", in_action[:, 8].min(), in_action[:, 8].max(),
-        #       "\ndim9:", in_action[:, 9].min(), in_action[:, 9].max(),
-        #       )
-        '''
-        sample: Dict,keys=dict_keys(['obs', 'action'])
-        obs: Dict,keys=dict_keys(['agentview_rgb', 'language'])
-        -agentview_rgb,<class 'torch.Tensor'>,shape=torch.Size([32, 3, 128, 128]),min=0.0122,max=0.7695
-        -language,<class 'torch.Tensor'>,shape=torch.Size([32, 2, 30]),min=0.0000,max=49407.0000
-        action,<class 'torch.Tensor'>,shape=torch.Size([32, 10]),min=-1.0000,max=0.9999
-        '''
+        normed_actions = self.norm_action(torch_data["action"])
+        if self.has_joint_states:
+            normed_gripper_states = (torch_data["obs"]["gripper_states"] - self.meta_gripper_states_mean) / self.meta_gripper_states_std
+            normed_ee_states = (torch_data["obs"]["ee_states"] - self.meta_ee_states_mean) / self.meta_ee_states_std
+            normed_joint_states = (torch_data["obs"]["joint_states"] - self.meta_joint_mean) / self.meta_joint_std
+        else:
+            normed_gripper_states = torch.zeros((self.horizon, 2), dtype=torch.float32)
+            normed_ee_states = torch.zeros((self.horizon, 6), dtype=torch.float32)
+            normed_joint_states = torch.zeros((self.horizon, 7), dtype=torch.float32)
 
         ''' Get t5 embeddings '''
         if "t5" in self.language_emb_model:
@@ -428,26 +518,41 @@ class LiberoReplayImageDataset(BaseImageDataset):
         else:
             t5_text_embeddings = torch.zeros(512, 1024, dtype=torch.bfloat16)
 
+        # Check the view choice
+        ret_n_views = len(self.camera_keys)
+        view_indices_selection = [self.CAMERA_TO_VIEW_ID[camera_key] for camera_key in self.camera_keys]
+        view_indices_t = torch.tensor(view_indices_selection).repeat_interleave(self.horizon)
+        latent_view_indices_t = torch.tensor(view_indices_selection).repeat_interleave(self.state_t)
+        n_video_tensors = []
+        for camera_key in self.camera_keys:
+            one_video_tensor = (torch_data['obs'][camera_key].permute(1, 0, 2, 3) * 255.).to(torch.uint8)  # (C,T,H,W)
+            n_video_tensors.append(one_video_tensor)
+        ret_video = torch.cat(n_video_tensors, dim=1)  # (C,T*ret_n_views,H,W)
+
+        # Get agent pos
+        ret_agent_pos = torch.cat((normed_joint_states, normed_gripper_states[:, :1]), dim=1)  # (T,7+1)
+
         ''' Remap keys to match the cosmos-predict2 output format '''
-        ret_video = (torch_data['obs']['agentview_rgb'].permute(1, 0, 2, 3) * 255.
-                     ).to(torch.uint8)  # (C,T,H,W) in [0,255]
-        ret_agent_pos = torch.zeros((self.horizon, 7), dtype=torch.float32)  # (T,7)
         remapped_data = {
-            "action": nactions,  # (horizon,10), normalized by (x-mean)/std ~[-1,1]
+            "action": normed_actions,  # (horizon,10), normalized by (x-mean)/std ~[-1,1]
             "video": ret_video,  # (3,T,128,128), [0,255] torch.uint8
-            "agent_pos": ret_agent_pos,  # (T,2), [-1,1]
+            "agent_pos": ret_agent_pos,  # (T,7+1), [-1,1]
             "annotation_file": "None",
             "__key__": "None",
             "t5_text_embeddings": t5_text_embeddings,
             "t5_text_mask": torch.ones(512, dtype=torch.int64),  # although embeddings have zero vectors, mask is all 1
-            "fps": 10,
+            "fps": 20,  # ori:10
             "image_size": torch.tensor([
                 128, 128, 128, 128
             ]),
-            "num_frames": ret_video.shape[1],  # v_cond (+v_out)
+            "num_frames": self.horizon,  # v_cond (+v_out)
             "padding_mask": torch.zeros(1, 128, 128),  # (T,H,W) not used; cond mask is set in conditioner
             # "num_conditional_frames": n_v_cond,  # different across in a single batch
             # "num_conditional_actions": n_a_cond,
+            # Multi-view related
+            "sample_n_views": ret_n_views,
+            "view_indices": view_indices_t,
+            "latent_view_indices_B_T": latent_view_indices_t,  # here is (T,), but will be (B,T) in DataLoader
         }
         return remapped_data
 

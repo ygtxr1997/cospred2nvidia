@@ -30,6 +30,7 @@ from cosmos_predict2.models.text2image_dit import VideoRopePosition3DEmb, Learna
 from cosmos_predict2.models.text2image_dit import (Block, Attention, VideoSize, GPT2FeedForward,
                                                    Timesteps, TimestepEmbedding)
 from cosmos_predict2.models.text2image_dit import apply_rotary_pos_emb, NattenA2AAttnOp, NeighborhoodAttention
+from cosmos_predict2.models.multiview_dit import MultiCameraVideoRopePosition3DEmb
 from imaginaire.utils.graph import create_cuda_graph
 from imaginaire.utils import log
 
@@ -51,6 +52,8 @@ class AttentionWExpert(Attention):
             ex_n_heads: int = 8,
             ex_head_dim: int = 64,
             ex_dropout: float = 0.0,
+            # Multi-view related parameters
+            n_cameras: int = 1,
     ) -> None:
         super(AttentionWExpert, self).__init__(query_dim, context_dim, n_heads, head_dim, dropout,
                                                qkv_format, backend, natten_params)
@@ -82,6 +85,8 @@ class AttentionWExpert(Attention):
         self._ex_query_dim = ex_query_dim
         self._ex_context_dim = ex_context_dim
         self._ex_inner_dim = ex_inner_dim
+
+        self._n_cameras = n_cameras
 
         self.init_weights()
 
@@ -208,12 +213,44 @@ class AttentionWExpert(Attention):
             ex_input: Optional[torch.Tensor] = None,
             ex_rope_emb: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # NOTE: In NVIDIA MultiViewDiT, x is (B,V*L,D), context is (B,V*M,D), they are reshaped
+        # to (B*V,L,D) and (B*V,M,D) inside Attention forward function to avoid information leak across views.
+        # In our setting, x is (B,V*L,D), context is (B,M,D), ex_input is (B,La,D), we will reshape them to
+        # x:(V*B,L,D), context:(V*B,M,D), ex_input:(V*B,La,D), they have the same batch size.
         # In Self-Attn: context will be set as [x, ex_input]
         # In Cross-Attn: context will be set as [context (e.g. text embeddings)]
-        (q, k, v), (q_ex, k_ex, v_ex) = self.compute_qkv(x, context, rope_emb=rope_emb,
+
+        # Not reshaping is better for gripper and static tokens to attend to each other
+        needs_reshape = False  # False:static and gripper will attend to each other; True: not attend to each other
+        is_self_attn = context is None
+        needs_reshape = needs_reshape and is_self_attn and (self._n_cameras > 1)  # only reshape in self-attn with multi-view
+        # print("[DEBUG] AttentionWExpert forward is_self_attn:", is_self_attn, "needs_reshape:", needs_reshape,)
+
+        context_B_M_D = context
+        if needs_reshape:
+            assert context_B_M_D is None, "context_B_M_D should be None in self-attn"
+            # Reshape inputs to (V*B,...,D)
+            n_cameras = self._n_cameras
+            x = rearrange(x, "B (V L) D -> (V B) L D", V=n_cameras)
+            if ex_input is not None:
+                ex_input = ex_input.unsqueeze(1).repeat(1, n_cameras, 1, 1)  # (B,S,D) -> (B,V,S,D)
+                ex_input = rearrange(ex_input, "B V S D -> (V B) S D", V=n_cameras)
+                # print("[DEBUG] AttentionWExpert forward ex_input reshaped:", ex_input.shape, "ex_rope_emb:", ex_rope_emb.shape)
+
+        # Original attention forward
+        (q, k, v), (q_ex, k_ex, v_ex) = self.compute_qkv(x, context_B_M_D, rope_emb=rope_emb,
                                                          ex_input=ex_input, ex_rope_emb=ex_rope_emb)
         attn_ori, attn_expert = self.compute_attention(q, k, v, video_size=video_size,
                                                        q_ex=q_ex, k_ex=k_ex, v_ex=v_ex)
+
+        if needs_reshape:
+            # Reshape back
+            attn_ori = rearrange(attn_ori, "(V B) L D -> B (V L) D", V=self._n_cameras)
+            if attn_expert is not None:  # (V*B,S,D) -> (B,S,D)
+                attn_expert = rearrange(attn_expert, "(V B) S D -> B V S D", V=self._n_cameras)
+                ex_multi_view_reduce = "mean"  # "add" or "mean"
+                attn_expert = attn_expert.mean(dim=1) if ex_multi_view_reduce == "mean" else attn_expert.sum(dim=1)
+                # print("[DEBUG] AttentionWExpert forward attn_ori:", attn_ori.shape, "attn_expert:", attn_expert.shape)
         return attn_ori, attn_expert
 
 
@@ -235,6 +272,8 @@ class BlockWExpert(Block):
             ex_num_heads: int = 16,
             ex_mlp_ratio: float = 4.0,
             ex_adaln_lora_dim: int = 64,
+            # Multi-view related parameters
+            n_cameras: int = 1,
     ):
         super().__init__(x_dim, context_dim, num_heads, mlp_ratio, use_adaln_lora,
                          adaln_lora_dim, self_attention_backend, cross_attention_backend, natten_params)
@@ -251,6 +290,7 @@ class BlockWExpert(Block):
             ex_query_dim=ex_dim,
             ex_n_heads=ex_num_heads,
             ex_head_dim=ex_dim // ex_num_heads,
+            n_cameras=n_cameras,
         )
 
         self.cross_attn = AttentionWExpert(
@@ -627,7 +667,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         if kwargs.get("crossattn_emb_channels") is None:
             kwargs["crossattn_emb_channels"] = 1024
 
-        # Expert-specific parameters
+        # Expert-specific parameters: action
         assert "ex_dim" in kwargs, "ex_dim must be provided"
         action_dof = kwargs["action_dof"]
         ex_num_latent_frames = int(kwargs["ex_num_latent_frames"])
@@ -639,6 +679,23 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         del kwargs["action_dof"], kwargs['ex_num_latent_frames'], kwargs["ex_num_tokens_per_latent_frame"], (
             kwargs)["ex_dim"], (kwargs)["ex_num_heads"], kwargs["ex_mlp_ratio"], kwargs["ex_adaln_lora_dim"]
 
+        # Additional cross-attn parameters: robot states
+        assert "extra_robot_states_dim" in kwargs, "extra_robot_states_dim must be provided"
+        extra_robot_states_dim = kwargs["extra_robot_states_dim"]
+        del kwargs["extra_robot_states_dim"]
+
+        # Multi-view parameters
+        assert "n_cameras_emb" in kwargs, "n_cameras_emb must be provided"
+        self.state_t = int(kwargs["state_t"])
+        self.n_cameras_emb= int(kwargs["n_cameras_emb"])
+        self.view_condition_dim = int(kwargs["view_condition_dim"])
+        self.concat_view_embedding = bool(kwargs["concat_view_embedding"])
+        del kwargs["state_t"], kwargs["n_cameras_emb"], kwargs["view_condition_dim"], kwargs["concat_view_embedding"]
+
+        assert "in_channels" in kwargs, "in_channels must be provided"
+        kwargs["in_channels"] += (
+            self.view_condition_dim if self.concat_view_embedding else 0
+        )  # this avoids overwritting build_patch_embed which still adds padding_mask channel as appropriate
         super().__init__(*args, **kwargs)
 
         # Add action encoder
@@ -669,8 +726,41 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         #     drop=0,
         # )
 
+        # Add robot states (agent_pos) encoder
+        # (1) For video branch, same dim as time embedding
+        self.agent_pos_video_embedder_B_D = Mlp(
+            in_features=extra_robot_states_dim,
+            hidden_features=extra_robot_states_dim * 4,
+            out_features=self.model_channels,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
+        self.agent_pos_video_embedder_B_3D = Mlp(
+            in_features=extra_robot_states_dim,
+            hidden_features=extra_robot_states_dim * 4,
+            out_features=self.model_channels * 3,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
+        # (2) For expert branch, same dim as action time embedding
+        self.agent_pos_action_embedder_B_D = Mlp(
+            in_features=extra_robot_states_dim,
+            hidden_features=extra_robot_states_dim * 4,
+            out_features=self.ex_dim,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
+        self.agent_pos_action_embedder_B_3D = Mlp(
+            in_features=extra_robot_states_dim,
+            hidden_features=extra_robot_states_dim * 4,
+            out_features=self.ex_dim * 3,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
+
         # Replace Blocks with BlockWExpert
         num_blocks = len(self.blocks)
+        del self.blocks
         self.blocks = nn.ModuleList(
             [
                 BlockWExpert(
@@ -691,6 +781,8 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
                     ex_num_heads=ex_num_heads,
                     ex_mlp_ratio=ex_mlp_ratio,
                     ex_adaln_lora_dim=ex_adaln_lora_dim,
+                    # Multi-view related
+                    n_cameras=self.n_cameras_emb,
                 )
                 for i in range(num_blocks)
             ]
@@ -713,6 +805,10 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         self.action_reshape = lambda act_B_TD: rearrange(
             act_B_TD, "b (t d) -> b t d", d=action_dof)
 
+        # Add view embedding
+        if self.concat_view_embedding:
+            self.view_embeddings = nn.Embedding(self.n_cameras_emb, self.view_condition_dim)
+
         # Initialize weights once again to include new modules
         self.init_weights()
         self.count_parameters()
@@ -724,6 +820,11 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             self.action_embedder_B_D.init_weights()
             self.action_decoder_B_D.init_weights()
             self.action_t_embedding_norm.reset_parameters()
+        if hasattr(self, "agent_pos_video_embedder_B_D"):
+            self.agent_pos_video_embedder_B_D.init_weights()
+            self.agent_pos_video_embedder_B_3D.init_weights()
+            self.agent_pos_action_embedder_B_D.init_weights()
+            self.agent_pos_action_embedder_B_3D.init_weights()
 
     def count_parameters(self) -> int:
         total_params = 0
@@ -733,6 +834,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         base_params = 0
         action_embedder_params = 0
         action_decoder_params = 0
+        agent_pos_embedder_params = 0
 
         for name, param in self.named_parameters():
             param_count = param.numel()
@@ -741,11 +843,15 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             if param.requires_grad:
                 trainable_params += param_count
 
-            if 'ex_' in name or 'expert' in name or 'action' in name:
+            if ('ex_' in name or 'expert' in name
+                    or 'action' in name or 'agent_pos' in name
+                    or 'view_embeddings' in name):
                 expert_params += param.numel()
-                if 'action_embedder_B_D' in name:
+                if 'agent_pos' in name:
+                    agent_pos_embedder_params += param.numel()
+                elif 'action_embedder_B_D' in name:
                     action_embedder_params += param.numel()
-                if 'action_decoder_B_D' in name:
+                elif 'action_decoder_B_D' in name:
                     action_decoder_params += param.numel()
             else:
                 base_params += param.numel()
@@ -757,6 +863,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             'expert_parameters (M)': expert_params / 1_000_000,
             'action_embedder_parameters (M)': action_embedder_params / 1_000_000,
             'action_decoder_parameters (M)': action_decoder_params / 1_000_000,
+            'agent_pos_embedder_parameters (M)': agent_pos_embedder_params / 1_000_000,
             'base_parameters (M)': base_params / 1_000_000,
             'total_size_mb': total_params * 4 / (1024 * 1024),  # 假设float32
         }
@@ -778,6 +885,10 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         action_B_T_D: Optional[torch.Tensor] = None,  # as self-attn input rather than cross-attn kv
         action_timesteps_B_T: Optional[torch.Tensor] = None,  # due to different mask length, this can be different from timesteps_B_T
         condition_action_input_mask_B_T_D: Optional[torch.Tensor] = None,
+        # Robot states
+        agent_pos: Optional[torch.Tensor] = None,  # (B,T,8)
+        # Multi-view related
+        view_indices_B_T: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
@@ -808,6 +919,14 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         assert action_emb_B_T_1_1_D.shape[-1] == self.ex_dim, f"action_emb {action_emb_B_T_1_1_D.shape} != {self.ex_dim}"
         # action_emb_B_3D = self.action_embedder_B_3D(action)
 
+        # NOTE: project agent_pos to video branch and expert branch
+        assert agent_pos is not None, "agent_pos must be provided"
+        agent_pos = rearrange(agent_pos, "b t d -> b 1 (t d)")
+        agent_pos_video_emb_B_D = self.agent_pos_video_embedder_B_D(agent_pos)
+        agent_pos_video_emb_B_3D = self.agent_pos_video_embedder_B_3D(agent_pos)
+        agent_pos_action_emb_B_D = self.agent_pos_action_embedder_B_D(agent_pos)
+        agent_pos_action_emb_B_3D = self.agent_pos_action_embedder_B_3D(agent_pos)
+
         assert isinstance(
             data_type, DataType
         ), f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
@@ -824,7 +943,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         #       "\nx_B_T_H_W_D", x_B_T_H_W_D.shape,
         #       "\naction_emb_B_T_1_W_D", action_emb_B_T_1_W_D.shape)
         '''
-        x_B_T_H_W_D torch.Size([12, 5, 16, 16, 2048]) 
+        x_B_T_H_W_D torch.Size([12, 2*5, 16, 16, 2048]) 
         action_emb_B_T_1_W_D torch.Size([12, 12, 1, 1, 512])
         rope_emb_L_1_1_D.shape: torch.Size([1088, 1, 1, 128]) 
         crossattn_emb.shape: torch.Size([12, 512, 1024])
@@ -842,6 +961,14 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         # t_embedding_B_T_D = t_embedding_B_T_D + action_emb_B_D
         # adaln_lora_B_T_3D = adaln_lora_B_T_3D + action_emb_B_3D
         #### END
+
+        # NOTE: follow NVIDIA AdaLN, sum the timestep embedding and agent_pos embedding before normalization
+        # (1) Video branch
+        t_embedding_B_T_D = t_embedding_B_T_D + agent_pos_video_emb_B_D
+        adaln_lora_B_T_3D = adaln_lora_B_T_3D + agent_pos_video_emb_B_3D
+        # (1) Action branch
+        action_t_embedding_B_T_D = action_t_embedding_B_T_D + agent_pos_action_emb_B_D
+        action_adaln_lora_B_T_3D = action_adaln_lora_B_T_3D + agent_pos_action_emb_B_3D
 
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
         action_t_embedding_B_T_D = self.action_t_embedding_norm(action_t_embedding_B_T_D)
@@ -882,6 +1009,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             "ex_adaln_lora_B_T_3D": action_adaln_lora_B_T_3D,
         }  # fixed for all blocks
         for block in blocks:
+            # print("[DEBUG] dit.forward: before block", "action_emb_B_T_1_W_D", action_emb_B_T_1_W_D.shape,)
             x_B_T_H_W_D, action_emb_B_T_1_W_D = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
@@ -897,6 +1025,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         action_B_HorizonDof = self.action_decoder_B_D(
             rearrange(action_emb_B_T_1_W_D, "b t 1 w d -> b (t w d)")
         )
+        # print("[DEBUG] dit.forward: after action_decoder", "action_B_HorizonDof", action_B_HorizonDof.shape,)
         action_B_Horizon_Dof = self.action_reshape(action_B_HorizonDof)  # (B, horizon, dof)
         return x_B_C_Tt_Hp_Wp, action_B_Horizon_Dof
 
@@ -906,6 +1035,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         action_emb_B_T_1_1_D: torch.Tensor,
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        view_indices_B_T: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor],
             Optional[torch.Tensor]]:
         """
@@ -940,6 +1070,27 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
             )
+
+        cp_size = 1  # hard coded for now
+        n_cameras = (x_B_C_T_H_W.shape[2] * cp_size) // self.state_t
+        if self.concat_view_embedding:
+            view_indices_B_T = view_indices_B_T.clamp(max=self.n_cameras_emb - 1)
+            view_indices_B_T = view_indices_B_T.to(x_B_C_T_H_W.device).long()
+            view_embedding = self.view_embeddings(view_indices_B_T)  # B, (V T), D
+            view_embedding = rearrange(view_embedding, "B (V T) D -> B D V T", V=n_cameras)
+            view_embedding = view_embedding.unsqueeze(-1).unsqueeze(-1)  # Shape: [B, D, V, T, 1, 1]
+            x_B_C_V_T_H_W = rearrange(x_B_C_T_H_W, "B C (V T) H W -> B C V T H W", V=n_cameras)
+            view_embedding = view_embedding.expand(
+                x_B_C_V_T_H_W.shape[0],
+                view_embedding.shape[1],
+                view_embedding.shape[2],
+                x_B_C_V_T_H_W.shape[3],
+                x_B_C_V_T_H_W.shape[4],
+                x_B_C_V_T_H_W.shape[5],
+            )
+            x_B_C_V_T_H_W = torch.cat([x_B_C_V_T_H_W, view_embedding], dim=1)
+            x_B_C_T_H_W = rearrange(x_B_C_V_T_H_W, " B C V T H W -> B C (V T) H W", V=n_cameras)
+
         # print("[DEBUG] dit.prepare_embedded_sequence before embed", "x_B_C_T_H_W", x_B_C_T_H_W.shape,)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)  # ([12, 18, 5, 32, 32]) -> ([12, 5, 16, 16, 2048])
         # print("[DEBUG] dit.prepare_embedded_sequence after embed", "x_B_T_H_W_D", x_B_T_H_W_D.shape,)
@@ -980,7 +1131,8 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
 
     def build_pos_embed(self) -> None:
         if self.pos_emb_cls == "rope3d":
-            cls_type = VideoRopePosition3DEmb
+            cls_type = VideoRopePosition3DEmb  # ori:VideoRopePosition3DEmb, or:MultiCameraVideoRopePosition3DEmb
+            expert_cls_type = VideoRopePosition3DEmb
         else:
             raise ValueError(f"Unknown pos_emb_cls {self.pos_emb_cls}")
 
@@ -999,6 +1151,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             w_extrapolation_ratio=self.rope_w_extrapolation_ratio,
             t_extrapolation_ratio=self.rope_t_extrapolation_ratio,
             enable_fps_modulation=self.rope_enable_fps_modulation,
+            n_cameras=self.n_cameras_emb,
         )
         self.pos_embedder = cls_type(
             **kwargs,  # type: ignore
@@ -1007,7 +1160,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         # NOTE: add expert pos_embedder
         expert_kwargs = kwargs.copy()  # keep most settings the same
         expert_kwargs["len_h"] = 1
-        self.expert_pos_embedder = cls_type(
+        self.expert_pos_embedder = expert_cls_type(
             **expert_kwargs,  # type: ignore
         )
 

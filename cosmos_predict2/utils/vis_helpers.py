@@ -10,12 +10,71 @@ def save_action_as_image(action_T_D: np.ndarray, save_path):
     Save action sequence as trajectory image.
     action_T_D: (T,D) numpy array, expected shape (T,2) or (T,3) with values in [-1,1]
     """
-    if action_T_D.shape[1] == 2:
+    if action_T_D.shape[1] == 1:
+        save_1d_action_as_image(action_T_D, save_path)
+    elif action_T_D.shape[1] == 2:
         save_2d_action_as_image(action_T_D, save_path)
     elif action_T_D.shape[1] == 3:
         save_3d_action_as_image(action_T_D, save_path)
     else:
         raise ValueError(f"Unsupported action dimension: {action_T_D.shape[1]}")
+
+
+def save_1d_action_as_image(action_T_D: np.ndarray, save_path):
+    """
+    Save 1D action sequence as time series plot with time-based color gradient.
+    action_T_D: (T,1) numpy array, expected shape (T,1) with values in [-1,1]
+    """
+    print("[DEBUG] save_1d_action_as_image:", action_T_D.shape, action_T_D.dtype, action_T_D.min(), action_T_D.max())
+
+    # Validate input shape
+    if len(action_T_D.shape) != 2 or action_T_D.shape[1] != 1:
+        raise ValueError(f"Expected shape (T,1), got {action_T_D.shape}")
+
+    # Extract the 1D values
+    values = action_T_D[:, 0]  # (T,)
+    T = len(action_T_D)
+    time_steps = np.arange(T)
+
+    # Create 2D plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Create color map from light to dark over time
+    colors = plt.cm.plasma(np.linspace(0.2, 1.0, T))
+
+    # Plot trajectory points
+    for i in range(T):
+        ax.scatter(time_steps[i], values[i], c=[colors[i]], s=50, alpha=0.8, edgecolors='white', linewidth=0.5)
+
+    # Plot trajectory lines
+    if T > 1:
+        for i in range(T - 1):
+            ax.plot([time_steps[i], time_steps[i + 1]],
+                    [values[i], values[i + 1]],
+                    color=colors[i], alpha=0.6, linewidth=2)
+
+    # Set up the plot
+    y_min, y_max = -0.2, 0.2
+    y_min = min(values.min(), y_min)  # in case action out of our expected range: [-0.2,1.2]
+    y_max = max(values.max(), y_max)
+
+    ax.set_xlim(-0.5, T - 0.5)
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel('Action Value')
+    ax.set_title('1D Action Trajectory Over Time')
+    ax.grid(True, alpha=0.3)
+
+    # Add colorbar to show time progression
+    sm = plt.cm.ScalarMappable(cmap='plasma', norm=mcolors.Normalize(vmin=0, vmax=T - 1))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, shrink=0.8, aspect=10)
+    cbar.set_label('Time Step')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+    plt.close()
+    print(f"Saved 1D action trajectory visualization to {save_path}")
 
 
 def save_2d_action_as_image(action_T_D: np.ndarray, save_path):

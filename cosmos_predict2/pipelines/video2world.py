@@ -525,6 +525,7 @@ class Video2WorldPipeline(BasePipeline):
                 if original_length < expected_length:
                     print("[WARNING] Video has fewer frames than expected. Padding with last frame.")
                 if original_length != expected_length:
+                    print("[WARNING] Video has different number of frames than expected. Resampling.")
                     video = rearrange(data_batch[input_key], "b c t h w -> b t c h w")
                     video = UniformTemporalSubsample(expected_length)(video)
                     data_batch[input_key] = rearrange(video, "b t c h w -> b c t h w")

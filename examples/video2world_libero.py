@@ -16,6 +16,8 @@
 import argparse
 import json
 import os
+import yaml
+from pathlib import Path
 
 import attrs
 import mediapy as mp
@@ -25,15 +27,20 @@ import numpy as np
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
+import einops
 from megatron.core import parallel_state
 
 # from cosmos_predict2.configs.action_conditioned.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
 # from cosmos_predict2.pipelines.video2world_action import Video2WorldActionConditionedPipeline
-from cosmos_predict2.configs.expert.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT
+from cosmos_predict2.configs.expert.config import (
+    PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT,
+    create_config_from_checkpoint,
+)
 from cosmos_predict2.configs.expert.experiment.exp_libero import cospred2_2b_expert_libero
 from cosmos_predict2.pipelines.video2world_expert import Video2WorldExpertPipeline
 # from cosmos_predict2.data.action_conditioned.pusht_dataset import PushTImageDataset
 from cosmos_predict2.data.action_conditioned.libero_dataset import LiberoReplayImageDataset
+from cosmos_predict2.utils.ckpt_load_helpers import load_config_from_checkpoint_dir
 from cosmos_predict2.utils.vis_helpers import save_action_as_image
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video
@@ -41,10 +48,11 @@ from imaginaire.utils.io import save_image_or_video
 
 def get_action_sequence(val_dataset, dataset_index=0):
     data = val_dataset[dataset_index]
-    action = data["action"]  # (T,2), in [0,1]
-    video = data["video"].permute(1, 2, 3, 0)  # (3,T,256,256)->(T,H,W,C), in [0,255]
+    action = data["action"]  # (T,2), in [-1,1]
+    agent_pos = data["agent_pos"]  # (T,8), in [-1,1]
+    video = data["video"].permute(1, 2, 3, 0)  # (3,V*T,256,256)->(V*T,H,W,C), in [0,255]
     t5_text_embeddings = data["t5_text_embeddings"]  # (512,1024), in bf16
-    return action.numpy(), video.numpy(), t5_text_embeddings
+    return action.numpy(), agent_pos.numpy(), video.numpy(), t5_text_embeddings
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,29 +138,13 @@ def parse_args() -> argparse.Namespace:
 def setup_pipeline(args: argparse.Namespace):
     log.info(f"Using model size: {args.model_size}")
     if args.model_size == "2B":
-        config = PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT
-        exp_config = cospred2_2b_expert_libero['model']['config']['pipe_config']  # load from exp config
-
-        config_update_cnt = 0
-        config_ignore_cnt = 0
-        for key, value in exp_config.items():
-            if hasattr(config, key):
-                if key == "net":
-                    # special handling for nested attrs
-                    for net_key, net_value in value.items():
-                        if hasattr(config.net, net_key):
-                            setattr(config.net, net_key, net_value)
-                            config_update_cnt += 1
-                        else:
-                            log.warning(f"Key {net_key} not found in base config.net. Skipping.")
-                            config_ignore_cnt += 1
-                else:
-                    setattr(config, key, value)
-                config_update_cnt += 1
-            else:
-                log.warning(f"Key {key} not found in base config. Skipping.")
-                config_ignore_cnt += 1
-        log.info(f"Updated {config_update_cnt} keys from exp config. Ignored {config_ignore_cnt} keys.")
+        config_dict, config_path = load_config_from_checkpoint_dir(args.dit_path)
+        log.info(f"Loading config from: {config_path}")
+        config, config_dataset = create_config_from_checkpoint(config_dict)
+        log.info("Successfully created config from checkpoint file")
+        print(config)
+        # config = PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT
+        # exp_config = cospred2_2b_expert_libero['model']['config']['pipe_config']  # load from exp config
         dit_path = "checkpoints/nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned/model-480p-4fps.pth"
     else:
         raise ValueError("Invalid model size. Choose either '2B' or '14B'.")
@@ -195,7 +187,7 @@ def setup_pipeline(args: argparse.Namespace):
         text_encoder_path=text_encoder_path,
         device="cuda",
         torch_dtype=torch.bfloat16,
-        # load_ema_to_reg=args.load_ema,
+        load_ema_to_reg=args.load_ema,
         load_prompt_refiner=True,
     )
 
@@ -204,10 +196,51 @@ def setup_pipeline(args: argparse.Namespace):
 
 def read_first_frame(val_dataset, dataset_index=0, frame_index=0):
     data = val_dataset[dataset_index]
-    video = data["video"]  # (3,T,96,96), in [0,255]
-    video = video.permute(1, 2, 3, 0).cpu().numpy()  # (T,96,96,3), in [0,255]
+    sample_n_views = int(data["sample_n_views"])
+    video = data["video"]  # (3,V*T,H,W), in [0,255]
     print("[DEBUG] Video shape:", video.shape)
-    return video[frame_index]  # Return first frame as numpy array
+
+    video_C_V_T_H_W = einops.rearrange(video, "c (v t) h w -> c v t h w", v=sample_n_views)
+    first_frame_C_V_H_W = video_C_V_T_H_W[:, :, frame_index]  # (3,V,H,W)
+    # video = video.permute(1, 2, 3, 0).cpu().numpy()  # (T,96,96,3), in [0,255]
+    first_frame_V_H_W_C = first_frame_C_V_H_W.permute(1, 2, 3, 0).cpu().numpy()  # (V,H,W,C), in [0,255]
+    return first_frame_V_H_W_C  # Return first frame as numpy array
+
+
+def get_frames_from_multiview_video(video_VT_H_W_C, sample_n_views: int, start_idx=0, end_idx=None):
+    # video_VT_H_W_C: (V*T,H,W,C), in [0,255]
+    T = video_VT_H_W_C.shape[0] // sample_n_views
+    V = sample_n_views
+    assert video_VT_H_W_C.shape[0] == T * V, f"Expected first dimension to be divisible by {V}, got {video_VT_H_W_C.shape[0]}"
+    if end_idx is None:
+        end_idx = T
+
+    view_starts = np.arange(V) * T  # [0, T, 2T, ..., (V-1)*T]
+    time_offsets = np.arange(start_idx, end_idx)  # [start_idx, start_idx+1, ..., end_idx-1]
+    select_indices = (view_starts[:, None] + time_offsets).flatten()
+
+    select_frames_VT_H_W_C = video_VT_H_W_C[select_indices]  # (V*(end_idx-start_idx), H, W, C)
+    return select_frames_VT_H_W_C
+
+
+def cat_multiview_video_with_zeros(video_VT_H_W_C: np.ndarray, sample_n_views: int, zero_length: int):
+    V = sample_n_views
+    total_frames = video_VT_H_W_C.shape[0]
+    T = total_frames // V
+    H, W, C = video_VT_H_W_C.shape[1:]
+
+    assert total_frames == T * V, f"Expected first dimension to be divisible by {V}, got {total_frames}"
+
+    video_reshaped = video_VT_H_W_C.reshape(V, T, H, W, C)
+    # video_reshaped[0] *= 0
+    zeros = np.zeros((V, zero_length, H, W, C), dtype=np.uint8)
+
+    # Concatenate along time dimension: (V, T+zero_length, H, W, C)
+    video_with_zeros = np.concatenate([video_reshaped, zeros], axis=1)
+
+    # Reshape back: (V, T+zero_length, H, W, C) -> (V*(T+zero_length), H, W, C)
+    result = video_with_zeros.reshape(V * (T + zero_length), H, W, C)
+    return result
 
 
 def process_single_generation(
@@ -216,7 +249,7 @@ def process_single_generation(
 ):
     # chunk_action_max_len = 13 - 1  # a1=v1+v2-1, v1=1, v2=12
     chunk_action_horizon = chunk_size  # 24, horizon=a1+a2
-    chunk_max_obs = 5 + 4
+    chunk_max_obs = 4 * 1 + 1
     # pusht_val_dataset = PushTImageDataset(
     #     zarr_path=input_path,  #"./datasets/pusht/pusht_orange_random_v2.zarr",
     #     max_obs=chunk_max_obs,  # v1 in [1,max_obs]
@@ -233,6 +266,19 @@ def process_single_generation(
                 "agentview_rgb": {
                     "shape": [3, 128, 128],
                     "type": "rgb"
+                },
+                "eye_in_hand_rgb": {  # additional
+                    "shape": [3, 128, 128],
+                    "type": "rgb"
+                },
+                "ee_states": {  # additional, pos 3 + ori 3
+                    "shape": [6],
+                },
+                "gripper_states": {  # additional, [x,-x]
+                    "shape": [2],
+                },
+                "joint_states": {  # additional, 7}
+                    "shape": [7],
                 },
                 "language": {
                     "shape": [15],
@@ -251,16 +297,24 @@ def process_single_generation(
         val_ratio=0.01,
         language_emb_model="t5xxl",  # ori: "clip"
         data_aug=True,
-        normalizer_type="all",  # not used
+        normalizer_type="all",  # not used,
+        # use full state
+        cache_zarr_path="/home/geyuan/datasets/LIBERO_uva25rss/libero_10_full_clip_t5xxl.zarr.zip",
+        # multi-view related
+        camera_keys=[
+            "agentview_rgb",
+            "eye_in_hand_rgb",
+        ],
     ).get_validation_dataset()  # use validation set
     print("[DEBUG] Libero dataset length:", len(libero_dataset))
-    actions, frames, t5_embeddings = get_action_sequence(libero_dataset, dataset_index=dataset_index)
-    # actions: (T,2), in [0,1]
-    # frames: (T,H,W,C), in [0,255]
+    actions, agent_pos, frames, t5_embeddings = get_action_sequence(libero_dataset, dataset_index=dataset_index)
+    # actions: (T,2), in [-1,1]
+    # agent_pos: (T,8), in [-1,1]
+    # frames: (V*T,H,W,C), in [0,255]
     first_frame = read_first_frame(libero_dataset, dataset_index=dataset_index, frame_index=frame_index)
-    # first_frame: (H,W,C), in [0,255]
-    print("[DEBUG] single_generation gt. actions.shape:", actions.shape, "frames.shape:",
-          frames.shape, "first_frame.shape:", first_frame.shape,
+    # first_frame: (V,H,W,C), in [0,255]
+    print("[DEBUG] single_generation gt. actions.shape:", actions.shape, "agent_pos.shape:", agent_pos.shape,
+          "frames.shape:", frames.shape, "first_frame.shape:", first_frame.shape,
           "t5_embeddings.shape:", t5_embeddings.shape)
     '''
     actions.shape: (77, 2) 
@@ -270,9 +324,11 @@ def process_single_generation(
 
     log.info(f"Running Video2WorldPipeline\ninput: {input_path}")
 
+    sample_n_views = first_frame.shape[0]
     if autoregressive:
         log.info("Using autoregressive mode")
         video_chunks = []
+        video_chunks2 = []
         for i in range(0, len(actions), chunk_size):
             frame_start = i
             frame_end = i + chunk_max_obs + chunk_size  # load all frames (including obs and gt)
@@ -284,23 +340,40 @@ def process_single_generation(
                 log.info("Reached end of actions")
                 break
 
-            v, H, W, C = frames[frame_start : frame_start + chunk_max_obs].shape
-            in_frames = np.concatenate(
-                (frames[frame_start : frame_start + chunk_max_obs],
-                 np.zeros((chunk_size, H, W, C))), axis=0).astype(np.uint8)  # zero out gt frames
+            # v, H, W, C = frames[frame_start : frame_start + chunk_max_obs].shape
+            # in_frames = np.concatenate(
+            #     (frames[frame_start : frame_start + chunk_max_obs],
+            #      np.zeros((chunk_size, H, W, C))), axis=0).astype(np.uint8)  # zero out gt frames
+            v_cond_start = frame_start
+            v_cond_end = v_cond_start + chunk_max_obs
+            cond_frames = get_frames_from_multiview_video(
+                frames, sample_n_views, start_idx=v_cond_start, end_idx=v_cond_end
+            )  # (V*chunk_max_obs,H,W,C)
+            in_frames = cat_multiview_video_with_zeros(
+                cond_frames, sample_n_views, zero_length=chunk_size
+            ).astype(np.uint8) # (V*(chunk_max_obs+chunk_size),H,W,C), zero out gt frames
+            print("[DEBUG] in_frames.shape:", in_frames.shape)
+
+            save_image_or_video(
+                (torch.from_numpy(in_frames).float().permute(3, 0, 1, 2) / 255.),  # (C,T,H,W) float32 in [0,1]
+                f"output/in_video_view01_{i:02d}.mp4",
+                fps=4
+            )
+
             video, out_action = pipe(
                 # first_frame,
                 in_frames,  # a1=v1+v2-1, v1=1, v2=12
                 actions[action_start: action_end] * 0.,  # zero out gt actions
+                agent_pos[v_cond_start: v_cond_end],  # robot states, as observation
                 # np.zeros_like(actions[action_start : action_end]),  # chunk_size=(v1+v2)+a2, zero out gt actions
                 prompt=t5_embeddings,  # (512,1024), in bf16
                 num_conditional_frames=chunk_max_obs,
                 num_conditional_actions=0, #chunk_size,  # use all actions as condition (chunk_size) or predict all actions (0)
+                n_views=sample_n_views,
                 guidance=guidance,
                 seed=i,
-            )  # video:(B,C,T,H,W), in [-1,1], action:(B,a1+a2,2), in [-1,1]
+            )  # video:(B,C,V*T,H,W), in [-1,1], action:(B,a1+a2,2), in [-1,1]
             # first_frame = ((video[0, :, -1].permute(1, 2, 0).cpu().numpy() / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
-            # drop the last frame to avoid duplication
 
             with torch.no_grad():
                 # out_action = normalizer['action'].unnormalize(out_action)
@@ -315,12 +388,16 @@ def process_single_generation(
 
             print("[DEBUG] autoregressive video.shape:", video.shape, "out_action.shape:", out_action.shape)
             # video = video[:, :, :-1]  # (1,3,13-1,256,256)
-            save_image_or_video(video[0], save_path=f"output/out_video_{i:02d}.mp4", fps=10)
+            chunk_video_len_per_view = chunk_max_obs + chunk_size  # v1+v2
+            save_image_or_video(video[0, :, :chunk_video_len_per_view], save_path=f"output/out_video_view0_{i:02d}.mp4", fps=4)
+            save_image_or_video(video[0, :, chunk_video_len_per_view: chunk_video_len_per_view*2], save_path=f"output/out_video_view1_{i:02d}.mp4", fps=4)
             save_action_as_image(out_action[0, :, :3].cpu().numpy(), save_path=f"output/out_action_{i:02d}.png")
             save_action_as_image(vis_in_action[:, :3].cpu().numpy(), save_path=f"output/in_action_{i:02d}.png")
-            video_chunks.append(video)
+            video_chunks.append(video[:, :, :chunk_video_len_per_view])  # (B,3,v1+v2,H,W)
+            video_chunks2.append(video[:, :, chunk_video_len_per_view:])  # (B,3,v1+v2,H,W)
         video = torch.cat([video_chunks[0]] + [chunk[:, :, chunk_max_obs:] for chunk in video_chunks[1:]], dim=2)
-        print("[DEBUG] Final concatenated video.shape:", video.shape)
+        video2 = torch.cat([video_chunks2[0]] + [chunk[:, :, chunk_max_obs:] for chunk in video_chunks2[1:]], dim=2)
+        print("[DEBUG] Final concatenated video.shape:", video.shape,)
     else:
         video, _ = pipe(
             first_frame,
@@ -329,6 +406,7 @@ def process_single_generation(
             guidance=guidance,
             seed=seed,
         )
+        video2 = video  # placeholder
 
     if video is not None:
         save_fps = 10  # use lower fps for clearer visualization
@@ -337,9 +415,13 @@ def process_single_generation(
         output_dir = os.path.dirname(output_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        log.info(f"Saving generated video to: {output_path}")
-        save_image_or_video(video, output_path, fps=save_fps)
-        log.success(f"Successfully saved video to: {output_path}")
+
+        view0_output_path = output_path.replace(".mp4", "view0.mp4")
+        log.info(f"Saving generated video to: {view0_output_path}")
+        save_image_or_video(video, view0_output_path, fps=save_fps)
+        log.success(f"Successfully saved video to: {view0_output_path}")
+
+        save_image_or_video(video2, output_path.replace(".mp4", "view1.mp4"), fps=save_fps)
 
         # save the ground truth video for comparison
         gt_output_path = output_path.replace(".mp4", "_gt.mp4")

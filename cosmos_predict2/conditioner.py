@@ -145,6 +145,28 @@ class AbstractEmbModel(nn.Module):
         )
 
 
+class ConditionLocation(Enum):
+    """
+    Enum representing different camera condition locations for anymulti-to-multiview video generation.
+
+    Attributes:
+        NO_CAM: Indicates no camera is used for conditioning (i.e text2world)
+        REF_CAM: Indicates a reference camera is used for conditioning. (i.e single-to-multiview-text2world)
+        ANY_CAM: Indicates any camera can be used for conditioning. (i.e any-to-multiview-text2world)
+        FIRST_RANDOM_N: Indicates a random number of frames from all cameras are used for conditioning. (i.e video2world-multiview)
+
+    Note: Multiple locations can be set together when compatible.
+        - NO_CAM cannot be set with any other location.
+        - ANY_CAM and REF_CAM cannot be set simultaneously.
+        - FIRST_RANDOM_N can be set with ANY_CAM or REF_CAM.
+    """
+
+    NO_CAM = "no_cam"
+    REF_CAM = "ref_cam"
+    ANY_CAM = "any_cam"
+    FIRST_RANDOM_N = "first_random_n"
+
+
 class TextAttr(AbstractEmbModel):
     def __init__(self, input_key: List[str], dropout_rate: Optional[float] = 0.0):
         super().__init__()
@@ -441,16 +463,24 @@ class ActionCondition(VideoCondition):
     # action: Optional[torch.Tensor] = None  # denoising target output
     gt_actions: Optional[torch.Tensor] = None  # denoising target output
     condition_action_input_mask_B_T_D: Optional[torch.Tensor] = None  # binary mask, 1: condition, 0: predict
+    agent_pos: Optional[torch.Tensor] = None  # e.g joint_states 7 + gripper_state 1
+    # Multi-view related
+    state_t: Optional[int] = None
+    view_indices_B_T: Optional[torch.Tensor] = None
 
     def set_video_condition(
             self,
-            gt_frames: torch.Tensor,  # latent state, (B,D,4,32,32)
+            gt_frames: torch.Tensor,  # latent state, (B,D,1+1+3,32,32)
             random_min_num_conditional_frames: int,
             random_max_num_conditional_frames: int,
             num_conditional_frames: Optional[Union[torch.Tensor, int]] = None,  # (B) different across in a train batch
             # Action related
-            gt_actions: Optional[torch.Tensor] = None,  # raw action, (B,24,2)
+            gt_actions: Optional[torch.Tensor] = None,  # raw action, (B,12,2)
             num_conditional_actions: Optional[Union[torch.Tensor, int]] = None,  # (B) different across in a train batch
+            agent_pos: Optional[torch.Tensor] = None,  # robot states, (B,4+1,8)
+            # Multi-view related
+            state_t: int = None,  # should be provided
+            condition_locations: Union[ConditionLocationList, ListConfig] = [ConditionLocation.FIRST_RANDOM_N],
     ) -> ActionCondition:
         """
         Sets the video conditioning frames for video-to-video generation.
@@ -512,6 +542,8 @@ class ActionCondition(VideoCondition):
         kwargs = self.to_dict(skip_underscore=False)
         kwargs["gt_frames"] = gt_frames
         kwargs["gt_actions"] = gt_actions
+        kwargs["agent_pos"] = agent_pos
+        kwargs["state_t"] = state_t
 
         B, _, T, H, W = gt_frames.shape
         condition_video_input_mask_B_C_T_H_W = torch.zeros(
@@ -520,6 +552,16 @@ class ActionCondition(VideoCondition):
         B, Ta, _ = gt_actions.shape
         condition_action_input_mask_B_T_D = torch.zeros(
             B, Ta, 1, dtype=gt_actions.dtype, device=gt_actions.device
+        )
+
+        assert agent_pos is not None, "agent_pos should be provided for ActionCondition"
+        assert len(condition_locations) > 0, "condition_locations must be provided."
+        assert state_t is not None, "state_t must be provided."
+        assert T > 1, "Image batches are not supported."
+        assert T % state_t == 0, f"T must be a multiple of state_t. Got T={T} and state_t={state_t}."
+        sample_n_views = T // state_t
+        condition_video_input_mask_B_C_V_T_H_W = torch.zeros(
+            B, 1, sample_n_views, state_t, H, W, dtype=gt_frames.dtype, device=gt_frames.device
         )
 
         # Handle type of num_conditional_frames and num_conditional_actions
@@ -545,16 +587,23 @@ class ActionCondition(VideoCondition):
                 )
             # Action, always equal to (T_raw - 1), where T_raw = len(gt_frames) (i.e. x0)
             # The last frame's action should be predicted, rather than conditioned on.
-            T_raw = (T - 1) * 4 + 1  # e.g. T=4 -> T_raw=13;
+            T_raw = sample_n_views * ((state_t - 1) * 4 + 1)  # e.g. T=4 -> T_raw=13;
             # num_conditional_actions_B = torch.ones(B, dtype=torch.int32) * (T_raw - 1)
             num_conditional_actions_B = num_conditional_actions
             # print("[DEBUG] ActionCondition. num_conditional_frames_B:", num_conditional_frames_B,
             #       "num_conditional_actions_B:", num_conditional_actions_B,)
 
         for idx in range(B):
-            condition_video_input_mask_B_C_T_H_W[idx, :, : num_conditional_frames_B[idx], :, :] += 1
+            condition_video_input_mask_B_C_V_T_H_W[
+                idx, :, :, : num_conditional_frames_B[idx], :, :
+            ] += 1
+            # condition_video_input_mask_B_C_T_H_W[idx, :, : num_conditional_frames_B[idx], :, :] += 1
             condition_action_input_mask_B_T_D[idx, : num_conditional_actions_B[idx], :] += 1
 
+        condition_video_input_mask_B_C_T_H_W = rearrange(
+            condition_video_input_mask_B_C_V_T_H_W,
+            "B C V T H W -> B C (V T) H W", V=sample_n_views
+        )
         # print("[DEBUG] ActionCondition. condition_video_input_mask_B_C_T_H_W:", condition_video_input_mask_B_C_T_H_W,
         #       "condition_action_input_mask_B_T_D:", condition_action_input_mask_B_T_D,
         #       "num_conditional_frames_B:", num_conditional_frames_B,
@@ -574,6 +623,9 @@ class ActionCondition(VideoCondition):
             num_conditional_frames=num_conditional_frames,
             gt_actions=self.gt_actions,
             num_conditional_actions=num_conditional_actions,
+            agent_pos=self.agent_pos,
+            state_t=self.state_t,
+            # condition_locations=[ConditionLocation.FIRST_RANDOM_N],  # not used here
         )
         if not is_cfg_conditional:
             # Do not use classifier free guidance on conditional frames.
@@ -587,13 +639,17 @@ class ActionCondition(VideoCondition):
         # extra efforts
         gt_frames = self.gt_frames
         gt_actions = self.gt_actions
+        agent_pos = self.agent_pos
+        view_indices_B_T = self.view_indices_B_T
         condition_video_input_mask_B_C_T_H_W = self.condition_video_input_mask_B_C_T_H_W
         condition_action_input_mask_B_T_D = self.condition_action_input_mask_B_T_D
         kwargs = self.to_dict(skip_underscore=False)
         kwargs["gt_frames"] = None
         kwargs["gt_actions"] = None
+        kwargs["agent_pos"] = None
         kwargs["condition_video_input_mask_B_C_T_H_W"] = None
         kwargs["condition_action_input_mask_B_T_D"] = None
+        kwargs["view_indices_B_T"] = None
         new_condition = TextCondition.broadcast(
             type(self)(**kwargs),
             process_group,
@@ -601,20 +657,46 @@ class ActionCondition(VideoCondition):
 
         kwargs = new_condition.to_dict(skip_underscore=False)
         _, _, T, _, _ = gt_frames.shape
+        n_views = T // self.state_t
+        assert T % self.state_t == 0, f"T must be a multiple of state_t. Got T={T} and state_t={self.state_t}."
         if process_group is not None:
             if T > 1 and process_group.size() > 1:  # when will go here?
-                gt_frames = broadcast_split_tensor(gt_frames, seq_dim=2, process_group=process_group)
-                gt_actions = broadcast_split_tensor(gt_actions, seq_dim=1, process_group=process_group)
-                condition_video_input_mask_B_C_T_H_W = broadcast_split_tensor(
-                    condition_video_input_mask_B_C_T_H_W, seq_dim=2, process_group=process_group
+                gt_frames_B_C_V_T_H_W = rearrange(gt_frames, "B C (V T) H W -> B C V T H W", V=n_views)
+                condition_video_input_mask_B_C_V_T_H_W = rearrange(
+                    condition_video_input_mask_B_C_T_H_W, "B C (V T) H W -> B C V T H W", V=n_views
                 )
+                view_indices_B_V_T = rearrange(view_indices_B_T, "B (V T) -> B V T", V=n_views)
+
+                gt_frames_B_C_V_T_H_W = broadcast_split_tensor(
+                    gt_frames_B_C_V_T_H_W, seq_dim=3, process_group=process_group)
+                condition_video_input_mask_B_C_V_T_H_W = broadcast_split_tensor(
+                    condition_video_input_mask_B_C_V_T_H_W, seq_dim=3, process_group=process_group)
+                view_indices_B_V_T = broadcast_split_tensor(
+                    view_indices_B_V_T, seq_dim=2, process_group=process_group)
+
+                gt_frames_B_C_T_H_W = rearrange(gt_frames_B_C_V_T_H_W, "B C V T H W -> B C (V T) H W", V=n_views)
+                condition_video_input_mask_B_C_T_H_W = rearrange(
+                    condition_video_input_mask_B_C_V_T_H_W, "B C V T H W -> B C (V T) H W", V=n_views
+                )
+                view_indices_B_T = rearrange(view_indices_B_V_T, "B V T -> B (V T)", V=n_views)
+
+                # gt_frames = broadcast_split_tensor(gt_frames, seq_dim=2, process_group=process_group)
+                # condition_video_input_mask_B_C_T_H_W = broadcast_split_tensor(
+                #     condition_video_input_mask_B_C_T_H_W, seq_dim=2, process_group=process_group
+                # )
+
+                gt_actions = broadcast_split_tensor(gt_actions, seq_dim=1, process_group=process_group)
                 condition_action_input_mask_B_T_D = broadcast_split_tensor(
                     condition_action_input_mask_B_T_D, seq_dim=1, process_group=process_group
                 )
-        kwargs["gt_frames"] = gt_frames
+                agent_pos = broadcast_split_tensor(agent_pos, seq_dim=1, process_group=process_group)
+
+        kwargs["gt_frames"] = gt_frames_B_C_T_H_W
         kwargs["gt_actions"] = gt_actions
+        kwargs["agent_pos"] = agent_pos
         kwargs["condition_video_input_mask_B_C_T_H_W"] = condition_video_input_mask_B_C_T_H_W
         kwargs["condition_action_input_mask_B_T_D"] = condition_action_input_mask_B_T_D
+        kwargs["view_indices_B_T"] = view_indices_B_T
         return type(self)(**kwargs)
 
 
@@ -823,28 +905,6 @@ class ActionConditioner(VideoConditioner):
         output["gt_actions"] = batch["action"]
         del output["action"]  # remove action from output, as it is not part of ActionCondition
         return ActionCondition(**output)
-
-
-class ConditionLocation(Enum):
-    """
-    Enum representing different camera condition locations for anymulti-to-multiview video generation.
-
-    Attributes:
-        NO_CAM: Indicates no camera is used for conditioning (i.e text2world)
-        REF_CAM: Indicates a reference camera is used for conditioning. (i.e single-to-multiview-text2world)
-        ANY_CAM: Indicates any camera can be used for conditioning. (i.e any-to-multiview-text2world)
-        FIRST_RANDOM_N: Indicates a random number of frames from all cameras are used for conditioning. (i.e video2world-multiview)
-
-    Note: Multiple locations can be set together when compatible.
-        - NO_CAM cannot be set with any other location.
-        - ANY_CAM and REF_CAM cannot be set simultaneously.
-        - FIRST_RANDOM_N can be set with ANY_CAM or REF_CAM.
-    """
-
-    NO_CAM = "no_cam"
-    REF_CAM = "ref_cam"
-    ANY_CAM = "any_cam"
-    FIRST_RANDOM_N = "first_random_n"
 
 
 class ConditionLocationListValidator(Validator):

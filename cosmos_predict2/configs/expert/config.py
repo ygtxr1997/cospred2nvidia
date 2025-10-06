@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Tuple
 import attrs
 
 from cosmos_predict2.conditioner import ActionConditioner, BooleanFlag, ReMapkey, TextAttr
@@ -31,6 +32,7 @@ from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
 from imaginaire.config import make_freezable
 from imaginaire.lazy_config import LazyCall as L
 from imaginaire.lazy_config import LazyDict
+from imaginaire.utils import log
 
 
 @make_freezable
@@ -84,6 +86,13 @@ PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
     ex_num_heads=16,
     ex_mlp_ratio=4.0,
     ex_adaln_lora_dim=128,
+    # NOTE: add agent pos params
+    extra_robot_states_dim=2 * 5,  # (dim * n_obs), dim: e.g., libero: joint_states 7 + gripper_state 1 (or pusht: 2)
+    # NOTE: add multi-view params
+    state_t=5,  # same as pipeline
+    n_cameras_emb=2,  # how many camera views available during training
+    view_condition_dim=2,  # dimension of view condition embeddings, can be different from n_cameras_emb
+    concat_view_embedding=True,  # True: not supported yet; False: supported (recommended)
 )
 
 # Modified: action_conditioned/config.py PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
@@ -116,6 +125,19 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldExpertPipelineConfig(
         action=L(ReMapkey)(
             input_key="action",
             output_key="action",
+            dropout_rate=0.0,
+            dtype=None,
+        ),
+        agent_pos=L(ReMapkey)(  # e.g joint_states 7 + gripper_state 1
+            input_key="agent_pos",
+            output_key="agent_pos",
+            dropout_rate=0.0,
+            dtype=None,
+        ),
+        # NOTE: multi-view related
+        view_indices_B_T=L(ReMapkey)(
+            input_key="latent_view_indices_B_T",
+            output_key="view_indices_B_T",
             dropout_rate=0.0,
             dtype=None,
         ),
@@ -157,3 +179,29 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldExpertPipelineConfig(
     max_act_out=12,
     p_all_actions_as_condition=0.3,
 )
+
+
+def create_config_from_checkpoint(config_dict) -> Tuple[Video2WorldExpertPipelineConfig, dict]:
+    """从加载的配置字典创建 Video2WorldExpertPipelineConfig 对象"""
+    try:
+        if hasattr(config_dict, 'model') and hasattr(config_dict.model, 'config') and hasattr(config_dict.model.config,
+                                                                                              'pipe_config'):
+            pipe_config = config_dict.model.config.pipe_config
+            dataset_config = config_dict.dataloader_train.dataset
+
+            if isinstance(pipe_config, Video2WorldExpertPipelineConfig):
+                log.info("Successfully loaded pipe_config from pkl file")
+                return pipe_config, dataset_config
+            else:
+                log.warning(f"Loaded pipe_config type: {type(pipe_config)}, attempting conversion")
+                # 如果不是预期类型，尝试转换
+                if hasattr(pipe_config, '__dict__'):
+                    return pipe_config, dataset_config
+                else:
+                    raise ValueError(f"Cannot convert pipe_config of type {type(pipe_config)}")
+        else:
+            raise ValueError("Expected config structure not found in loaded config")
+
+    except Exception as e:
+        log.warning(f"Failed to extract pipe_config from loaded config: {e}")
+        raise

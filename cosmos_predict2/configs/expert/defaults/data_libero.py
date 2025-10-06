@@ -23,6 +23,7 @@ from cosmos_predict2.data.action_conditioned.libero_dataset import LiberoReplayI
 from imaginaire.lazy_config import LazyCall as L
 
 
+# NOTE: not registered here, will be registered in `data.py`
 libero_train_dataset = L(LiberoReplayImageDataset)(
     shape_meta={
         "image_resolution": 128,

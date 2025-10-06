@@ -74,6 +74,11 @@ pusht_val_dataset = L(PushTImageDataset)(
 )
 
 
+n_v_cond, n_v_out = 4 * 1 + 1, 4 * 5  # 4+1+20=25
+n_a_out = n_v_out
+n_latent_v_cond, n_latent_v_out = 1 * 1 + 1, 1 * 5  # 1+1+5=7
+horizon = n_v_cond + n_v_out # 25
+pad_before = n_v_cond - 1
 libero_train_dataset = L(LiberoReplayImageDataset)(
     shape_meta={
         "image_resolution": 128,
@@ -85,16 +90,29 @@ libero_train_dataset = L(LiberoReplayImageDataset)(
                 "shape": [3, 128, 128],
                 "type": "rgb"
             },
+            "eye_in_hand_rgb": {  # additional
+                "shape": [3, 128, 128],
+                "type": "rgb"
+            },
+            "ee_states": {  # additional, pos 3 + ori 3
+                "shape": [6],
+            },
+            "gripper_states": {  # additional, [x,-x]
+                "shape": [2],
+            },
+            "joint_states": {  # additional, 7}
+                "shape": [7],
+            },
             "language": {
                 "shape": [15],
             }
         }
     },
     dataset_path="/home/geyuan/datasets/LIBERO_uva25rss/libero_10",
-    horizon=33,  # max length of each clip
-    pad_before=4 * 2,  # m_obs-1
+    horizon=horizon,  # max length of each clip
+    pad_before=pad_before,  # m_obs-1
     pad_after=1,
-    n_obs_steps=4 * 2 + 1,  # not used
+    n_obs_steps=pad_before + 1,  # not used
     abs_action=True,
     rotation_rep="rotation_6d",
     use_cache=True,
@@ -103,8 +121,15 @@ libero_train_dataset = L(LiberoReplayImageDataset)(
     language_emb_model="t5xxl",  # ori: "clip"
     data_aug=True,
     normalizer_type="all",  # not used
-    # TODO: full dataset
+    # full: use static+gripper+joint;
+    # clip: uva provided; t5xxl: use t5xxl embedding;
     cache_zarr_path="/home/geyuan/datasets/LIBERO_uva25rss/libero_10_full_clip_t5xxl.zarr.zip",
+    # multi-view related
+    camera_keys=[
+        "agentview_rgb",
+        "eye_in_hand_rgb",
+    ],
+    p_camera_drop=0.2,  # ori:0
 )
 
 libero_val_dataset = libero_train_dataset

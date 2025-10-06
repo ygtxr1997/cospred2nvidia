@@ -3,10 +3,12 @@ import os
 import zarr
 import argparse
 from functools import partial
+import re
 
 from tqdm import tqdm
 import numpy as np
 
+from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
 from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
 from cosmos_predict2.data.action_conditioned.libero_dataset import (
     ReplayBuffer,
@@ -28,9 +30,24 @@ def text_to_t5_embedding(
         text: str,
         t5_model: CosmosT5TextEncoder,
         max_length: int = 512,
+        prompt_refiner_model: CosmosReason1 = None,
+        filter_scene_index: bool = False,
 ) -> tuple[np.ndarray, int]:
     """Mock function to convert text to T5 embeddings. Replace with actual model inference."""
+    if filter_scene_index:
+        # 删除从开头到包括首个“数字_”位置的所有字符
+        text = re.sub(r'^.*?\d+\s', '', text)
+        text = text.replace('_', ' ')
     print("[DEBUG] text:", text)
+
+    if prompt_refiner_model is not None:
+        print("[DEBUG] Refining prompt...")
+        refined = prompt_refiner_model.refine_prompt(
+            image_or_video_path="",
+            prompt=text,
+        )
+        print("[DEBUG] Refined prompt:", refined)
+        text = refined[0]
 
     encoded_text, mask_bool = t5_model.encode_prompts(
         text, max_length=max_length, return_mask=True
@@ -201,10 +218,18 @@ if __name__ == "__main__":
     text_to_t5_embedding_func = partial(
         text_to_t5_embedding,
         t5_model=encoder,
-        max_length=args.max_length
+        max_length=args.max_length,
+        filter_scene_index=False,
     )
 
     clip_tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+
+    # Initialize prompt refiner
+    # prompt_refiner = CosmosReason1(
+    #     checkpoint_dir="checkpoints/nvidia/Cosmos-Reason1-7B",
+    #     offload_model_to_cpu=True,
+    #     enabled=True,
+    # )
 
     # V1
     # convert_zarr_cache_with_t5(

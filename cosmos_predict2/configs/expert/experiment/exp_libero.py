@@ -22,6 +22,11 @@ torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train  \
     --config=cosmos_predict2/configs/base/config.py  \
     -- experiment="cospred2_2b_expert_libero"
 """
+n_v_cond, n_v_out = 4 * 1 + 1, 4 * 5  # 4+1+20=25
+n_a_out = n_v_out
+n_latent_v_cond, n_latent_v_out = 1 * 1 + 1, 1 * 5  # 1+1+5=7
+horizon = n_v_cond + n_v_out # 25
+pad_before = n_v_cond - 1
 cospred2_2b_expert_libero = dict(
     defaults=[
         {"override /model": "predict2_v2w_2b_expert_fsdp"},  # modified
@@ -36,18 +41,25 @@ cospred2_2b_expert_libero = dict(
             fsdp_shard_size=-1,
             # train_architecture="lora",
             pipe_config=dict(
+                ema=dict(enabled=True),  # ema is usually better
                 net=dict(
-                    action_dim=10*24,  # (act_dim * horizon)
+                    action_dim=10*n_a_out,  # (act_dim * horizon)
                     action_dof=10,  # libero: 3 xyz + 6 rot + 1 gripper
-                    ex_num_latent_frames=24,
+                    ex_num_latent_frames=n_a_out,
+                    ex_dim=1024,
+                    ex_adaln_lora_dim=256,
+                    extra_robot_states_dim=8*n_v_cond,  # (D*T), (joint + gripper) * max_obs
+                    state_t=n_latent_v_cond + n_latent_v_out,  # same as pipeline
+                    n_cameras_emb=2,  # ori:2
+                    concat_view_embedding=False,  # NVIDIA doesn't provide the 7-view ckpt
                 ),
-                state_t=2+1+6,  # raw:8+1+24=33,
-                max_obs=8+1,
-                max_act_out=24,
+                state_t=n_latent_v_cond + n_latent_v_out,  # raw:8+1+24=33,
+                max_obs=n_v_cond,
+                max_act_out=n_a_out,
                 p_all_actions_as_condition=0.3,
             ),
             # model_manager_config=dict(
-            #     dit_path="checkpoints/cosmos_predict2/debug/cospred2_2b_expert_libero_2025-09-22_11-09-29/checkpoints/model/iter_000020000.pt",
+            #     dit_path="checkpoints/cosmos_predict2/debug/cospred2_2b_expert_libero_2025-09-29_09-08-00/checkpoints/model/iter_000005000.pt",
             # )
         )
     ),
@@ -56,8 +68,8 @@ cospred2_2b_expert_libero = dict(
         context_parallel_size=1,
     ),
     dataloader_train=dict(
-        batch_size=28,  # ori:24
-        num_workers=6,
+        batch_size=20,  # now:20, ori:28
+        num_workers=7,
     ),
     trainer=dict(
         distributed_parallelism="fsdp",
@@ -72,6 +84,14 @@ cospred2_2b_expert_libero = dict(
     ),
     optimizer=dict(
         lr=1e-4,  # or:1e-4,
+    ),
+    scheduler=dict(  # better
+        cycle_lengths=[20_000, 20_000],
+        warm_up_steps=[2_000, 0],
+        f_start=[0.01, 0.01],
+        f_max=[1.0, 1.0],
+        f_min=[1.0, 0.1],
+        verbosity_interval=2_000
     ),
 )
 

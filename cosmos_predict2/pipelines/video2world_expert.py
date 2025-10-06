@@ -64,6 +64,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         text_encoder_path: str = "",
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
+        load_ema_to_reg: bool = False,
         load_prompt_refiner: bool = False,
     ) -> Any:
         # Create a pipe
@@ -144,19 +145,58 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         dit_config = config.net
         pipe.dit = instantiate(dit_config).eval()  # inference
 
-        # log.success("[DEBUG][Warning] disable the pretrain loading for faster debugging")
+        # # log.success("[DEBUG][Warning] disable the pretrain loading for faster debugging")
+        # if dit_path:
+        #     state_dict = load_state_dict(dit_path)
+        # # drop net. prefix
+        # state_dict_dit_compatible = dict()
+        # for k, v in state_dict.items():
+        #     if k.startswith("net."):
+        #         state_dict_dit_compatible[k[4:]] = v
+        #     else:
+        #         state_dict_dit_compatible[k] = v
+        # pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
+        # del state_dict, state_dict_dit_compatible
+        # log.success(f"Successfully loaded DiT from {dit_path}")
         if dit_path:
+            # load weights - already materializes tensors
             state_dict = load_state_dict(dit_path)
-        # drop net. prefix
-        state_dict_dit_compatible = dict()
-        for k, v in state_dict.items():
-            if k.startswith("net."):
-                state_dict_dit_compatible[k[4:]] = v
-            else:
-                state_dict_dit_compatible[k] = v
-        pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
-        del state_dict, state_dict_dit_compatible
-        log.success(f"Successfully loaded DiT from {dit_path}")
+            prefix_to_load = "net_ema." if load_ema_to_reg else "net."
+            # drop net. prefix
+            state_dict_dit_compatible = dict()
+            for k, v in state_dict.items():
+                if k.startswith(prefix_to_load):
+                    state_dict_dit_compatible[k[len(prefix_to_load):]] = v
+                else:
+                    state_dict_dit_compatible[k] = v
+
+            # 获取模型参数名称集合
+            model_param_names = set(pipe.dit.state_dict().keys())
+            checkpoint_param_names = set(state_dict_dit_compatible.keys())
+
+            # 统计加载情况
+            loaded_params = model_param_names & checkpoint_param_names  # 交集：能够加载的参数
+            missing_params = model_param_names - checkpoint_param_names  # 差集：模型有但检查点没有的参数
+            unused_params = checkpoint_param_names - model_param_names  # 差集：检查点有但模型不需要的参数
+
+            log.info(f"参数加载统计:")
+            log.info(f"  - 成功加载的参数: {len(loaded_params)}")
+            log.info(f"  - 模型缺失的参数: {len(missing_params)}")
+            log.info(f"  - 检查点多余的参数: {len(unused_params)}")
+
+            if missing_params:
+                log.warning(
+                    f"以下参数在检查点中缺失: {list(missing_params)[:10]}{'...' if len(missing_params) > 10 else ''}")
+
+            if unused_params:
+                log.warning(
+                    f"以下参数在检查点中多余: {list(unused_params)[:10]}{'...' if len(unused_params) > 10 else ''}")
+
+            pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
+            del state_dict, state_dict_dit_compatible
+            log.success(f"Successfully loaded DiT from {dit_path}")
+        else:
+            pipe.dit = pipe.dit.to(device=device, dtype=torch_dtype)
 
         # 6-2. Handle EMA
         if config.ema.enabled:
@@ -419,7 +459,16 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             action0=a0_pred_B_T_D, action_eps=action_eps_pred_B_T_D)
 
     def _randomly_sample_input_output_inplace(self, data_batch: dict) -> dict:
-        """ Randomly sample the input and output frames for training """
+        """ Randomly sample the input and output frames for training
+        Inputs:
+        video:      (B, 3,  V*(max_obs+max_act_out),    H,  W)
+        action:     (B, max_obs+max_act_out,    D)
+        agent_pos:  (B, max_obs+max_act_out,    7+1)
+        Outputs:
+        video:      (B, 3,  V*(v_cond+v_out),   H,      W)
+        action:     (B, a_out,  D)
+        agent_pos:  (B, v_cond, 7+1)
+        """
         # Randomly set num_cond_frames
         if np.random.uniform(0., 1.) <= self.p_all_actions_as_condition:
             # Input: v_cond, a_cond
@@ -436,7 +485,15 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             n_v_out = 0
             n_a_out = self.max_act_out
 
-        ret_video = data_batch[self.input_video_key][:, :, :n_v_cond + self.max_act_out]  # (B,3,v_cond+v_out,256,256)
+        # Process multi-view data
+        one_view_video_len = self.max_obs + self.max_act_out
+        all_view_video_len = data_batch[self.input_video_key].shape[2]
+        assert all_view_video_len % one_view_video_len == 0, \
+            f"video length {all_view_video_len} is not divisible by one_view_video_len {one_view_video_len}"
+        n_views = all_view_video_len // one_view_video_len
+
+        # Cut out the input and output frames
+        ret_video = data_batch[self.input_video_key][:, :, :all_view_video_len]  # (B,3,V*(v_cond+v_out),256,256)
         ret_action = data_batch[self.input_action_key][:, n_v_cond - 1: n_v_cond -1 + self.max_act_out]  # (B,a_out,2)
         ret_agent_pos = data_batch[self.input_agent_pos_key][:, :n_v_cond]  # (B,v_cond,2)
 
@@ -451,6 +508,16 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         data_batch[self.input_agent_pos_key] = ret_agent_pos
         data_batch[NUM_CONDITIONAL_FRAMES_KEY] = torch.ones(B, device=ret_video.device, dtype=torch.int32) * n_latent_v_cond
         data_batch[NUM_CONDITIONAL_ACTIONS_KEY] = torch.ones(B, device=ret_action.device, dtype=torch.int32) * n_a_cond
+
+    def _normalize_video_databatch_inplace(self, data_batch: dict[str, torch.Tensor], input_key: str = None) -> None:
+        """ Copied from: pipelines.multiview2video.py MultiView2VideoPipeline """
+        input_key = self.input_video_key if input_key is None else input_key
+        if input_key in data_batch:
+            num_video_frames_per_view = self.tokenizer.get_pixel_num_frames(self.config.state_t)  # 33
+            n_views = data_batch[input_key].shape[2] // num_video_frames_per_view  # 2
+            data_batch[input_key] = rearrange(data_batch[input_key], "B C (V T) H W -> (B V) C T H W", V=n_views)
+            super()._normalize_video_databatch_inplace(data_batch, input_key)
+            data_batch[input_key] = rearrange(data_batch[input_key], "(B V) C T H W -> B C (V T) H W", V=n_views)
 
     def get_data_and_condition(
             self, data_batch: dict[str, torch.Tensor], needs_sampling_input_output: bool = True
@@ -491,8 +558,106 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             num_conditional_frames=num_conditional_frames,
             gt_actions=data_batch['action'],
             num_conditional_actions=num_conditional_actions,
+            agent_pos=data_batch['agent_pos'],
+            state_t=self.config.state_t,  # required by multi-view
         )
         return raw_state, latent_state, condition
+
+    @torch.no_grad()
+    def encode(self, state: torch.Tensor) -> torch.Tensor:
+        n_views = state.shape[2] // self.tokenizer.get_pixel_num_frames(self.config.state_t)
+        cp_group = self.get_context_parallel_group()
+        cp_size = 1 if cp_group is None else cp_group.size()
+        if n_views > 4 and cp_size > 1 and n_views <= cp_size:
+            return self.encode_cp(state)
+        state = rearrange(state, "B C (V T) H W -> (B V) C T H W", V=n_views)
+        encoded_state = super().encode(state)
+        encoded_state = rearrange(encoded_state, "(B V) C T H W -> B C (V T) H W", V=n_views)
+        return encoded_state
+
+    @torch.no_grad()
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        n_views = latent.shape[2] // self.config.state_t
+        cp_group = self.get_context_parallel_group()
+        cp_size = 1 if cp_group is None else cp_group.size()
+        if n_views > 4 and cp_size > 1 and n_views <= cp_size:
+            return self.decode_cp(latent)
+        latent = rearrange(latent, "B C (V T) H W -> (B V) C T H W", V=n_views)
+        decoded_state = super().decode(latent)
+        decoded_state = rearrange(decoded_state, "(B V) C T H W -> B C (V T) H W", V=n_views)
+        return decoded_state
+
+    @torch.no_grad()
+    def encode_cp(self, state: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("encode_cp not tested yet")
+        cp_size = len(get_process_group_ranks(parallel_state.get_context_parallel_group()))
+        cp_group = parallel_state.get_context_parallel_group()
+        n_views = state.shape[2] // self.tokenizer.get_pixel_num_frames(self.config.state_t)
+        assert n_views < cp_size, f"n_views must be less than cp_size, got n_views={n_views} and cp_size={cp_size}"
+        state_V_B_C_T_H_W = rearrange(state, "B C (V T) H W -> V B C T H W", V=n_views)
+        state_input = torch.zeros((cp_size, *state_V_B_C_T_H_W.shape[1:]), **self.tensor_kwargs)
+        state_input[0:n_views] = state_V_B_C_T_H_W
+        local_state_V_B_C_T_H_W = broadcast_split_tensor(state_input, seq_dim=0, process_group=cp_group)
+        local_state = rearrange(local_state_V_B_C_T_H_W, "V B C T H W -> (B V) C T H W")
+        encoded_state = super().encode(local_state)
+        encoded_state_list = [torch.empty_like(encoded_state) for _ in range(cp_size)]
+        dist.all_gather(encoded_state_list, encoded_state, group=cp_group)
+        encoded_state = torch.cat(encoded_state_list[0:n_views], dim=2)  # [B, C, V * T, H, W]
+        return encoded_state
+
+    @torch.no_grad()
+    def decode_cp(self, latent: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("decode_cp not tested yet")
+        cp_size = len(get_process_group_ranks(parallel_state.get_context_parallel_group()))
+        cp_group = parallel_state.get_context_parallel_group()
+        log.info(f"latent.shape: {latent.shape}")
+        log.info(f"self.config.state_t: {self.config.state_t}")
+        n_views = latent.shape[2] // self.config.state_t
+        assert n_views < cp_size, f"n_views must be less than cp_size, got n_views={n_views} and cp_size={cp_size}"
+        latent_V_B_C_T_H_W = rearrange(latent, "B C (V T) H W -> V B C T H W", V=n_views)
+        latent_input = torch.zeros((cp_size, *latent_V_B_C_T_H_W.shape[1:]), **self.tensor_kwargs)
+        latent_input[0:n_views] = latent_V_B_C_T_H_W
+        local_latent_V_B_C_T_H_W = broadcast_split_tensor(latent_input, seq_dim=0, process_group=cp_group)
+        local_latent = rearrange(local_latent_V_B_C_T_H_W, "V B C T H W -> (B V) C T H W")
+        decoded_state = super().decode(local_latent)
+        decoded_state_list = [torch.empty_like(decoded_state) for _ in range(cp_size)]
+        dist.all_gather(decoded_state_list, decoded_state, group=cp_group)
+        decoded_state = torch.cat(decoded_state_list[0:n_views], dim=2)  # [B, C, V * T, H, W]
+        return decoded_state
+
+    def broadcast_split_for_model_parallelsim(
+        self,
+        x0_B_C_T_H_W: torch.Tensor,
+        condition: torch.Tensor,
+        epsilon_B_C_T_H_W: torch.Tensor,
+        sigma_B_T: torch.Tensor,
+    ):
+        """ Copied from: pipelines.multiview2video.py MultiView2VideoPipeline """
+        cp_group = self.get_context_parallel_group()
+        cp_size = 1 if cp_group is None else cp_group.size()
+        n_views = x0_B_C_T_H_W.shape[2] // self.config.state_t
+        if cp_size > 1 and n_views > 1:
+            x0_B_C_T_H_W = rearrange(x0_B_C_T_H_W, "B C (V T) H W -> (B V) C T H W", V=n_views).contiguous()
+            if epsilon_B_C_T_H_W is not None:
+                epsilon_B_C_T_H_W = rearrange(epsilon_B_C_T_H_W, "B C (V T) H W -> (B V) C T H W", V=n_views).contiguous()
+            reshape_sigma_B_T = False
+            if sigma_B_T is not None:
+                assert sigma_B_T.ndim == 2, "sigma_B_T should be 2D tensor"
+                if sigma_B_T.shape[-1] != 1:
+                    assert (
+                        sigma_B_T.shape[-1] % n_views == 0
+                    ), f"sigma_B_T temporal dimension T must either be 1 or a multiple of sample_n_views. Got T={sigma_B_T.shape[-1]} and sample_n_views={n_views}"
+                    sigma_B_T = rearrange(sigma_B_T, "B (V T) -> (B V) T", V=n_views).contiguous()
+                    reshape_sigma_B_T = True
+            x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T = super().broadcast_split_for_model_parallelsim(
+                x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T
+            )
+            x0_B_C_T_H_W = rearrange(x0_B_C_T_H_W, "(B V) C T H W -> B C (V T) H W", V=n_views)
+            if epsilon_B_C_T_H_W is not None:
+                epsilon_B_C_T_H_W = rearrange(epsilon_B_C_T_H_W, "(B V) C T H W -> B C (V T) H W", V=n_views)
+            if reshape_sigma_B_T:
+                sigma_B_T = rearrange(sigma_B_T, "(B V) T -> B (V T)", V=n_views)
+        return x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T
 
     def get_x0_fn_from_batch(
         self,
@@ -545,6 +710,8 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             num_conditional_frames=num_conditional_frames,
             gt_actions=data_batch['action'],
             num_conditional_actions=num_conditional_actions,
+            agent_pos=data_batch['agent_pos'],
+            state_t=self.config.state_t,  # required by multi-view
         )
         uncondition = uncondition.set_video_condition(
             gt_frames=x0,
@@ -553,6 +720,8 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             num_conditional_frames=num_conditional_frames,
             gt_actions=data_batch['action'],
             num_conditional_actions=num_conditional_actions,
+            agent_pos=data_batch['agent_pos'],
+            state_t=self.config.state_t,  # required by multi-view
         )
         # print("[DEUBG] input condition:", condition.gt_frames.shape, condition.gt_actions.shape)
         print("[DEBUG] num_conditional_frames:", num_conditional_frames, "num_conditional_actions:", num_conditional_actions)
@@ -608,10 +777,12 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         self,
         video: torch.Tensor,
         actions: torch.Tensor,
+        agent_pos: torch.Tensor,
         prompt: Union[str, torch.Tensor],
         negative_prompt: str = "",
         num_latent_conditional_frames: int = 1,
         num_conditional_actions: int = 0,
+        n_views: int = 1,
     ):
         """
         Called during inference.
@@ -641,9 +812,18 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         else:
             raise NotImplementedError("prompt must be a string or a tensor of shape (B, 512, 1024)")
 
-        print(f"[DEBUG] ({prompt if isinstance(prompt, str) else prompt.shape}) "
+        # Check n_views consistency
+        assert T == n_views * (agent_pos.shape[1] + actions.shape[1]), \
+            f"Video frames T ({T}) causes conflict, are you sure n_views ({n_views}) is correct? )"
+        # if "LIVING ROOM SCENE2" in prompt:
+        #     prompt = prompt.replace("LIVING ROOM SCENE2", "")
+
+        print(f"[DEBUG] prompt ({prompt if isinstance(prompt, str) else prompt.shape}) "
               f"t5_text_embeddings:", t5_text_embeddings.shape, t5_text_embeddings.dtype,
               t5_text_embeddings.min(), t5_text_embeddings.max())
+
+        latent_view_indices_T = torch.repeat_interleave(torch.arange(n_views), self.config.state_t)
+        latent_view_indices_B_T = latent_view_indices_T.unsqueeze(0).expand(B, -1).to(self.device)
 
         self.batch_size = B  # ori:1
         data_batch = {
@@ -651,11 +831,15 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             "video": video,
             # NOTE: we don't use text embeddings for action conditional video2world
             "t5_text_embeddings": t5_text_embeddings.repeat(self.batch_size, 1, 1),
-            "fps": torch.ones(self.batch_size) * 10,  # ori:torch.randint(16, 32, (self.batch_size,)),  # Random FPS (might be used by model)
+            "fps": torch.ones(self.batch_size) * 20,  # ori:torch.randint(16, 32, (self.batch_size,)),  # Random FPS (might be used by model)
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_latent_conditional_frames,  # ori:num_latent_conditional_frames,  # Specify number of conditional frames
             "num_conditional_actions": num_conditional_actions,
             "action": actions,
+            "agent_pos": agent_pos,  # (T,7+1), [-1,1]
+            # Multi-view related
+            "sample_n_views": n_views,
+            "latent_view_indices_B_T": latent_view_indices_B_T,  # in dataset is (T,), here is (B,T) like DataLoader
         }
 
         # Handle negative prompts for classifier-free guidance
@@ -672,8 +856,9 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        first_frame: np.ndarray,  # (v1+v2,H,W,C), in [0,255], uint8
+        first_frame: np.ndarray,  # (V*(v1+v2),H,W,C), in [0,255], uint8
         actions: np.ndarray,  # (a1+a2,D), in [-1,1], float32
+        agent_pos: np.ndarray,  # (v1+v2,7+1), in [-1,1], float32
         prompt: Union[str, torch.Tensor] = "",  # text prompt or text embeddings
         negative_prompt: str = "",
         num_conditional_frames: int = 5,
@@ -682,6 +867,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         num_sampling_step: int = 35,
         seed: int = 0,
         solver_option: str = "2ab",
+        n_views: int = 1,  # Multi-view related
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Parameter check
         # width, height = VIDEO_RES_SIZE_INFO[self.config.resolution]["16:9"]  # type: ignore
@@ -696,19 +882,21 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         # transform first frame and actions to tensor
         if first_frame.ndim == 4:
             # vid_input = torch.from_numpy(first_frame).permute(2, 0, 1)[None, :, None, ...]
-            vid_input = torch.from_numpy(first_frame).permute(3, 0, 1, 2)  # (THWC) -> (C, T, H, W)
+            vid_input = torch.from_numpy(first_frame).permute(3, 0, 1, 2)  # (VT,H,W,C) -> (C,VT,H,W)
             # Cv, Tv, H, W = vid_input.shape
             # vid_back_padding = torch.zeros((Cv, 1, H, W), dtype=vid_input.dtype)  # for padding to v1+v2+1 frames
             # vid_input = torch.cat((vid_input, vid_back_padding), dim=1)   # (C, v1+v2+1, H, W)
             vid_input = vid_input[None, ...]  # Add batch dimension (1,C,v1+v2+1,H,W)
             # print("first_frame", first_frame.shape, "vid_input", vid_input.shape)
             actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)[None, ...]  # (1,a1+a2,D)
+            agent_pos_tensor = torch.from_numpy(agent_pos).to(dtype=torch.bfloat16)[None, ...]  # (1,v1+v2,7+1)
         else:
             assert first_frame.ndim == 5, "first_frame must be 4 or 5 dims"
             assert actions.ndim == 3, "actions must be 3 dims"
             vid_input = torch.from_numpy(first_frame).permute(0, 4, 1, 2, 3)   # (B,C,T,H,W)
             actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)  # (B,a1+a2,D)
             assert vid_input.shape[0] == actions_tensor.shape[0], "first_frame and actions must have the same batch size"
+            agent_pos_tensor = torch.from_numpy(agent_pos).to(dtype=torch.bfloat16)  # (B,v1+v2,7+1)
 
         # Check prompt type, if it is a tensor, it must be of shape (512, 1024)
         if isinstance(prompt, torch.Tensor):
@@ -723,10 +911,12 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         data_batch = self._get_data_batch_input(
             vid_input,
             actions_tensor,
+            agent_pos_tensor,
             prompt,
             negative_prompt,
             num_latent_conditional_frames=num_latent_conditional_frames,
             num_conditional_actions=num_conditional_actions,
+            n_views=n_views,
         )
         from debug.printer import print_batch
         print_batch('[Video2WorldExpertPipeline] data_batch', data_batch)
@@ -760,7 +950,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         _T, _H, _W = data_batch[input_key].shape[-3:]
         state_shape = [
             self.config.state_ch,
-            self.tokenizer.get_latent_num_frames(_T),
+            self.config.state_t * n_views,  # consider multi-view
             _H // self.tokenizer.spatial_compression_factor,
             _W // self.tokenizer.spatial_compression_factor,
         ]
