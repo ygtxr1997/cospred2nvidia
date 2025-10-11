@@ -783,6 +783,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         num_latent_conditional_frames: int = 1,
         num_conditional_actions: int = 0,
         n_views: int = 1,
+        fps: int = 20,
     ):
         """
         Called during inference.
@@ -831,7 +832,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             "video": video,
             # NOTE: we don't use text embeddings for action conditional video2world
             "t5_text_embeddings": t5_text_embeddings.repeat(self.batch_size, 1, 1),
-            "fps": torch.ones(self.batch_size) * 20,  # ori:torch.randint(16, 32, (self.batch_size,)),  # Random FPS (might be used by model)
+            "fps": torch.ones(self.batch_size) * fps,  # ori:torch.randint(16, 32, (self.batch_size,)),  # Random FPS (might be used by model)
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_latent_conditional_frames,  # ori:num_latent_conditional_frames,  # Specify number of conditional frames
             "num_conditional_actions": num_conditional_actions,
@@ -856,19 +857,40 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        first_frame: np.ndarray,  # (V*(v1+v2),H,W,C), in [0,255], uint8
-        actions: np.ndarray,  # (a1+a2,D), in [-1,1], float32
-        agent_pos: np.ndarray,  # (v1+v2,7+1), in [-1,1], float32
-        prompt: Union[str, torch.Tensor] = "",  # text prompt or text embeddings
+        first_frame: np.ndarray,  # (.,V*(v1+v2),H,W,C), in [0,255], uint8, T=v1+v2
+        actions: np.ndarray,  # (.,v2,Da), in [-1,1], float32, H=a=v2
+        agent_pos: np.ndarray,  # (.,v1,Dp), in [-1,1], float32
+        prompt: Union[str, torch.Tensor] = "",  # text prompt or text embeddings (.,512,1024)
         negative_prompt: str = "",
-        num_conditional_frames: int = 5,
+        num_conditional_frames: int = 5,  # in raw space, must be 4k+1
         num_conditional_actions: int = 0,
         guidance: float = 7.0,
         num_sampling_step: int = 35,
         seed: int = 0,
         solver_option: str = "2ab",
         n_views: int = 1,  # Multi-view related
+        fps: int = 20,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Inference function for the Video2WorldExpertPipeline.
+        Args:
+            first_frame: shape (.,V*(v1+v2),H,W,C), in [0,255], uint8, T=v1+v2
+            actions: shape (.,v2,Da), in [-1,1], float32, H=a=v2
+            agent_pos: shape (.,v1,Dp), in [-1,1], float32
+            prompt: str or torch.Tensor, text prompt or text embeddings (.,512,1024)
+            negative_prompt:
+            num_conditional_frames: in raw space, must be 4k+1
+            num_conditional_actions:
+            guidance:
+            num_sampling_step:
+            seed:
+            solver_option:
+            n_views:
+            fps:
+
+        Returns:
+
+        """
         # Parameter check
         # width, height = VIDEO_RES_SIZE_INFO[self.config.resolution]["16:9"]  # type: ignore
         # height, width = self.check_resize_height_width(height, width)
@@ -881,22 +903,18 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
 
         # transform first frame and actions to tensor
         if first_frame.ndim == 4:
-            # vid_input = torch.from_numpy(first_frame).permute(2, 0, 1)[None, :, None, ...]
-            vid_input = torch.from_numpy(first_frame).permute(3, 0, 1, 2)  # (VT,H,W,C) -> (C,VT,H,W)
-            # Cv, Tv, H, W = vid_input.shape
-            # vid_back_padding = torch.zeros((Cv, 1, H, W), dtype=vid_input.dtype)  # for padding to v1+v2+1 frames
-            # vid_input = torch.cat((vid_input, vid_back_padding), dim=1)   # (C, v1+v2+1, H, W)
-            vid_input = vid_input[None, ...]  # Add batch dimension (1,C,v1+v2+1,H,W)
+            vid_input = torch.from_numpy(first_frame).permute(3, 0, 1, 2)  # (V*T,H,W,C) -> (C,V*T,H,W)
+            vid_input = vid_input[None, ...]  # Add batch dimension (1,C,V*T,H,W)
             # print("first_frame", first_frame.shape, "vid_input", vid_input.shape)
-            actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)[None, ...]  # (1,a1+a2,D)
-            agent_pos_tensor = torch.from_numpy(agent_pos).to(dtype=torch.bfloat16)[None, ...]  # (1,v1+v2,7+1)
+            actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)[None, ...]  # (1,v2,D)
+            agent_pos_tensor = torch.from_numpy(agent_pos).to(dtype=torch.bfloat16)[None, ...]  # (1,v1,D)
         else:
             assert first_frame.ndim == 5, "first_frame must be 4 or 5 dims"
             assert actions.ndim == 3, "actions must be 3 dims"
-            vid_input = torch.from_numpy(first_frame).permute(0, 4, 1, 2, 3)   # (B,C,T,H,W)
-            actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)  # (B,a1+a2,D)
+            vid_input = torch.from_numpy(first_frame).permute(0, 4, 1, 2, 3)   # (B,C,V*T,H,W)
+            actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)  # (B,v2,D)
             assert vid_input.shape[0] == actions_tensor.shape[0], "first_frame and actions must have the same batch size"
-            agent_pos_tensor = torch.from_numpy(agent_pos).to(dtype=torch.bfloat16)  # (B,v1+v2,7+1)
+            agent_pos_tensor = torch.from_numpy(agent_pos).to(dtype=torch.bfloat16)  # (B,v1,D)
 
         # Check prompt type, if it is a tensor, it must be of shape (512, 1024)
         if isinstance(prompt, torch.Tensor):
@@ -917,10 +935,12 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             num_latent_conditional_frames=num_latent_conditional_frames,
             num_conditional_actions=num_conditional_actions,
             n_views=n_views,
+            fps=fps,
         )
         from debug.printer import print_batch
         print_batch('[Video2WorldExpertPipeline] data_batch', data_batch)
         '''
+        PushT:
         [Video2WorldExpertPipeline] data_batch: Dict,keys=dict_keys(['dataset_name', 'video', 't5_text_embeddings', 'fps', 'padding_mask', 'num_conditional_frames', 'action'])
         dataset_name:<class 'str'>,len=10
         video,<class 'torch.Tensor'>,shape=torch.Size([1, 3, 13, 256, 256])
@@ -930,15 +950,18 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         num_conditional_frames:<class 'int'>,1
         action,<class 'torch.Tensor'>,shape=torch.Size([1, 24, 2])
         LIBERO:
-        [Video2WorldExpertPipeline] data_batch: Dict,keys=dict_keys(['dataset_name', 'video', 't5_text_embeddings', 'fps', 'padding_mask', 'num_conditional_frames', 'num_conditional_actions', 'action'])
+        [Video2WorldExpertPipeline] data_batch: Dict,keys=dict_keys(['dataset_name', 'video', 't5_text_embeddings', 'fps', 'padding_mask', 'num_conditional_frames', 'num_conditional_actions', 'action', 'agent_pos', 'sample_n_views', 'latent_view_indices_B_T'])
         dataset_name:<class 'str'>,len=10
-        video,<class 'torch.Tensor'>,shape=torch.Size([1, 3, 33, 128, 128]),min=0.0000,max=255.0000
-        t5_text_embeddings,<class 'torch.Tensor'>,shape=torch.Size([1, 512, 1024]),min=-0.7461,max=0.6172
-        fps,<class 'torch.Tensor'>,shape=torch.Size([1]),min=10.0000,max=10.0000
-        padding_mask,<class 'torch.Tensor'>,shape=torch.Size([1, 1, 128, 128]),min=0.0000,max=0.0000
-        num_conditional_frames:<class 'int'>,3
+        video,<class 'torch.Tensor'>,shape=torch.Size([30, 3, 50, 128, 128]),min=0.0000,max=255.0000
+        t5_text_embeddings,<class 'torch.Tensor'>,shape=torch.Size([30, 512, 1024]),min=-0.7305,max=0.6680
+        fps,<class 'torch.Tensor'>,shape=torch.Size([30]),min=20.0000,max=20.0000
+        padding_mask,<class 'torch.Tensor'>,shape=torch.Size([30, 1, 128, 128]),min=0.0000,max=0.0000
+        num_conditional_frames:<class 'int'>,2
         num_conditional_actions:<class 'int'>,0
-        action,<class 'torch.Tensor'>,shape=torch.Size([1, 24, 10]),min=0.0000,max=0.0000
+        action,<class 'torch.Tensor'>,shape=torch.Size([30, 20, 10]),min=0.0000,max=0.0000
+        agent_pos,<class 'torch.Tensor'>,shape=torch.Size([30, 5, 8]),min=-2.0781,max=1.8438
+        sample_n_views:<class 'int'>,2
+        latent_view_indices_B_T,<class 'torch.Tensor'>,shape=torch.Size([30, 14]),min=0.0000,max=1.0000
         '''
 
         # preprocess

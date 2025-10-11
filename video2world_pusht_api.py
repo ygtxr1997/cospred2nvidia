@@ -16,10 +16,9 @@ import json
 import torch
 from torchvision.transforms import transforms
 
+from cosmos_predict2.configs.expert.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT
 from cosmos_predict2.pipelines.video2world_expert import Video2WorldExpertPipeline
-
-from cosmos_predict2.configs.expert.experiment.exp_libero import cospred2_2b_expert_libero
-from cosmos_predict2.data.action_conditioned.libero_dataset import LiberoReplayImageDataset
+from cosmos_predict2.data.action_conditioned.pusht_dataset import PushTImageDataset
 
 from cosmos_predict2.utils.vis_helpers import save_action_as_image
 from cosmos_predict2.configs.expert.config import create_config_from_checkpoint
@@ -27,13 +26,14 @@ from cosmos_predict2.utils.ckpt_load_helpers import load_config_from_checkpoint_
 from cosmos_predict2.connects.protocols import StepRequestFromEvaluator, StepRequestFromPolicy
 from cosmos_predict2.connects.utils import get_frames_from_multiview_video, cat_multiview_video_with_zeros
 
+
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video
 
 
 """ How to use me?
 export PYTHONPATH=~/code/cospred2nvidia/
-CUDA_VISIBLE_DEVICES=6 uvicorn video2world_libero_api:gpu_app --port 6060
+CUDA_VISIBLE_DEVICES=6 uvicorn video2world_pusht_api:gpu_app --port 6060
 """
 gpu_app = FastAPI()
 max_cache_action = 4*5  # will notify evaluator the max length
@@ -45,85 +45,26 @@ LAST_OBS_FRAME_LAST = None
 LAST_OUT_ACTION = None
 
 COSMOS_ROOT="/home/geyuan/code/cospred2nvidia"
-MODEL_TIME = "2025-10-04_13-48-52"  # `2025-09-14_22-49-12`, "2025-09-17_16-40-09"
-ITERATION = "000038000"
+MODEL_TIME = "2025-10-10_12-52-51"
+ITERATION = "000020000"
 LOAD_EMA = True
-INPUT_DATASET_PATH="/home/geyuan/datasets/LIBERO_uva25rss/libero_10"
-INPUT_DATASET_INDICES = (0, 250, 500)
+INPUT_DATASET_PATH = f"{COSMOS_ROOT}/datasets/pusht/pusht_256_val.zarr"
+INPUT_DATASET_INDICES = (300, 100, 0)
 INPUT_VIDEO_FRAME_INDEX = 0
-
-
-@lru_cache()
-def get_dataset_and_normalizer():
-    """
-    Lazily initializes and caches the dataset and normalizer.
-    """
-    dataset = LiberoReplayImageDataset(
-        shape_meta={
-            "image_resolution": 128,
-            "action": {
-                "shape": [10]
-            },
-            "obs": {
-                "agentview_rgb": {
-                    "shape": [3, 128, 128],
-                    "type": "rgb"
-                },
-                "eye_in_hand_rgb": {  # additional
-                    "shape": [3, 128, 128],
-                    "type": "rgb"
-                },
-                "ee_states": {  # additional, pos 3 + ori 3
-                    "shape": [6],
-                },
-                "gripper_states": {  # additional, [x,-x]
-                    "shape": [2],
-                },
-                "joint_states": {  # additional, 7}
-                    "shape": [7],
-                },
-                "language": {
-                    "shape": [15],
-                }
-            }
-        },
-        dataset_path="/home/geyuan/datasets/LIBERO_uva25rss/libero_10",
-        horizon=max_cache_action + chunk_max_obs,  # 4*5+4*1+1=25
-        pad_before=chunk_max_obs - 1,
-        pad_after=1,
-        n_obs_steps=chunk_max_obs,
-        abs_action=True,
-        rotation_rep="rotation_6d",
-        use_cache=True,
-        seed=42,
-        val_ratio=0.01,
-        language_emb_model="t5xxl",
-        data_aug=True,
-        normalizer_type="all",
-        # use full state
-        cache_zarr_path="/home/geyuan/datasets/LIBERO_uva25rss/libero_10_full_clip_t5xxl.zarr.zip",
-        # multi-view related
-        camera_keys=[
-            "agentview_rgb",
-            "eye_in_hand_rgb",
-        ],
-    )
-    # normalizer = dataset.get_normalizer()
-    return dataset
 
 
 @lru_cache()
 def get_agent(device: str):
     args = OmegaConf.create({
         "model_size": "2B",
-        "dit_path": f"{COSMOS_ROOT}/checkpoints/cosmos_predict2/debug/cospred2_2b_expert_libero_{MODEL_TIME}/checkpoints/model/iter_{ITERATION}.pt",
+        "dit_path": f"{COSMOS_ROOT}/checkpoints/cosmos_predict2/debug/cospred2_2b_expert_pusht_{MODEL_TIME}/checkpoints/model/iter_{ITERATION}.pt",
         "input_video": INPUT_DATASET_PATH,
         "dataset_index": INPUT_DATASET_INDICES[-1],  # not used
         "frame_index": INPUT_VIDEO_FRAME_INDEX,  # not used
         "num_obs_frames": chunk_max_obs,
         "guidance": 0,
         "seed": 0,
-        "chunk_size": chunk_action_horizon,
+        "chunk_size": chunk_action_horizon,  # v2
         "load_ema": LOAD_EMA,
     })
 
@@ -133,8 +74,7 @@ def get_agent(device: str):
     log.info("Successfully created config from checkpoint file")
 
     dit_path = args.dit_path
-    # text_encoder_path = ""
-    text_encoder_path = "checkpoints/google-t5/t5-11b"
+    text_encoder_path = ""  # PushT doesn't use text encoder
 
     misc.set_random_seed(seed=args.seed, by_rank=True)
     # Initialize cuDNN.
@@ -166,7 +106,6 @@ def read_root():
 
 @gpu_app.get("/init")
 def model_init():
-    dataset = get_dataset_and_normalizer()
     return {"message": "Initialized.", "max_cache_action": max_cache_action}
 
 
@@ -179,9 +118,8 @@ def model_reset():
 
 @gpu_app.post("/step")
 def model_step(step_request: StepRequestFromEvaluator) -> Dict:
-    dataset = get_dataset_and_normalizer()
     agent, args, weight_path = get_agent("cuda")  # shape:[C,H,W]
-    print("[video2world_libero_api] Using cached ckpt from: None. Model type:", type(agent), weight_path)
+    print("[video2world_pusht_api] Using cached ckpt from: None. Model type:", type(agent), weight_path)
 
     # parse input observation
     step_data = step_request.decode_to_raw()
@@ -201,7 +139,7 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
     global LAST_OBS_FRAME_LAST, LAST_OUT_ACTION, CALLED_TIMES
     LAST_OBS_FRAME_LAST = get_frames_from_multiview_video(
         gt_video, sample_n_views=n_cameras, start_idx=Ts - v1, end_idx=Ts
-    )# (B,V*Ts,H,W,3) uint8 cut to (B,V*v1,H,W,3) uint8
+    )  # (B,V*Ts,H,W,3) uint8 cut to (B,V*v1,H,W,3) uint8
 
     if stage_flag == 0:  # cold start
         assert Ts >= v1, f"Only support Ts>=v1 in cold start, got Ts={Ts}, v1={v1}"
@@ -214,38 +152,41 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
             in_cond, sample_n_views=n_cameras, zero_length=max_cache_action
         )  # (B,V*(v1+a),H,W,3) uint8
         in_actions = np.zeros((B, max_cache_action, agent.config.net.action_dof), dtype=np.float32)  # (B,a,2) float32, in [-1,1]
-        in_robot_states = dataset.norm_agent_pos(torch.from_numpy(tcp_state[:, -v1:])).numpy()
+        # in_robot_states = dataset.norm_agent_pos(torch.from_numpy(tcp_state[:, -v1:])).numpy()
+        in_robot_states = (tcp_state[:, -v1:] / 256.) - 1.  # [0,512] -> [-1,1]
         print("[DEBUG] expert_api: in_frames:", in_frames.shape, in_frames.min(), in_frames.max(),
               "in_actions:", in_actions.shape, in_actions.min(), in_actions.max(),
-              "in_robot_states:", None if in_robot_states is None else in_robot_states.shape,)
+              "in_robot_states:", None if in_robot_states is None else in_robot_states.shape, )
         save_image_or_video(
             (torch.from_numpy(gt_video).float().permute(0, 4, 1, 2, 3) / 255.)[0],  # (B,C,T,H,W) float32 in [0,1]
-            f"output/libero_env_{ITERATION}_{CALLED_TIMES:03d}.mp4",
+            f"output/pusht_env_{ITERATION}_{CALLED_TIMES:03d}.mp4",
             fps=10
         )
         out_video, out_action = agent(
             in_frames,  # (B,v1+a,H,W,3) uint8
             in_actions,  # (B,a,D) float32
             in_robot_states,  # (B,v1,D) float32
-            prompt=instruction_text,  # str
             num_conditional_frames=v1,  # ori:1
             num_conditional_actions=0,
             n_views=n_cameras,
             guidance=args.guidance,
             seed=args.seed,
+            fps=10,  # hard code fps for pusht
         )  # out_action:(B,chunk_size,2) float32 in [-1,1]; out_video:(B,C,T,H,W) float32 in [-1,1]
         save_image_or_video(
-            out_video[0],
-            f"output/libero_out_video_{ITERATION}_{CALLED_TIMES:03d}.mp4",
+            out_video,
+            f"output/pusht_expert_pred_{ITERATION}.mp4",
             fps=10
         )
         save_action_as_image(
-            out_action[0, :, :3].cpu().numpy(),
-            save_path=f"output/libero_out_action_{ITERATION}_{CALLED_TIMES:03d}.png"
+            out_action[0, :, :2].cpu().numpy(),
+            save_path=f"output/pusht_out_action_{ITERATION}_{CALLED_TIMES:03d}.png"
         )
 
         # denorm action
-        out_action = dataset.denorm_action(out_action.cpu())
+        out_action = torch.clamp(out_action, min=-1., max=1.)
+        out_action = (out_action * 256. + 256.).cpu().numpy()  # in [0,512]
+
 
         # # Stage II. Frames+Actions -> Frames
         # in_frames = in_frames
@@ -264,16 +205,53 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
         #     fps=5
         # )
 
-        # out_action = torch.clamp(out_action, min=-1., max=1.)
-        # out_action = (out_action * 256. + 256.).cpu().numpy()  # in [0,512], for pusht
-        # out_action = normalizer['action'].unnormalize(out_action)
-        out_action = out_action.detach().cpu().numpy()  # in [-1,1]
-        # .detach().cpu().numpy()
-
     else:  # hot start
-        raise NotImplementedError("Only support cold start now.")
+        raise NotImplementedError
+        assert LAST_OBS_FRAME_LAST is not None and LAST_OUT_ACTION is not None, "last_out_action and last_obs_final should not be None in hot start"
+        assert v2 == max_cache_action, f"Only support v2=1 (cold start) or v2=max_cache_action (hot start), got v2={v2}"
+        assert LAST_OUT_ACTION.shape[1] == max_cache_action, f"Only support last_out_action.shape[1]=max_cache_action, got {LAST_OUT_ACTION.shape}"
+        B, a1, Da = LAST_OUT_ACTION.shape
+        noised_action = np.zeros((B, args.chunk_size - a1, Da), dtype=np.float32)
 
-    print("[DEBUG] expert_api: out_action:", out_action.shape, out_action.min(), out_action.max(),
+        in_frames = np.concatenate([LAST_OBS_FRAME_LAST, gt_video], axis=1)  # (B,v1+v2,H,W,3) uint8
+        in_actions = np.concatenate([LAST_OUT_ACTION, noised_action], axis=1, dtype=np.float32)  # (B,a1+a2,2) float32, in [0,512]
+        in_actions = in_actions / 512.0  # in [0,1]
+        out_video, out_action = agent(
+            in_frames,  # (B,v1+v2,H,W,3) uint8
+            in_actions,  # (B,a1,2) float32
+            num_conditional_frames=1 + max_cache_action,  # ori:1
+            action_cond_len=max_cache_action,  # a1
+            guidance=args.guidance,
+            seed=args.seed,
+        )
+        out_action = out_action[:, a1:, :]  # (B,a2,2) float32
+        out_action = (out_action * 512.0).cpu().numpy()  # in [0,512], for pusht
+        assert out_action.shape[:-1] == (B, max_cache_action), f"Only support out_action.shape=(B,{max_cache_action},2), got {out_action.shape}"
+
+        # save the generated video for debug
+        save_fps = 5  # use lower fps for clearer visualization
+
+        # save the generated video
+        output_path = f"output/pusht_expert_env_{ITERATION}.mp4"
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        log.info(f"Saving generated video to: {output_path}")
+        save_image_or_video(out_video, output_path, fps=save_fps)
+        log.success(f"Successfully saved video to: {output_path}")
+
+        # save the evaluator feedback video
+        feedback_video = gt_video[0]  # (B,v2,H,W,3) -> (v2,H,W,3)
+        feedback_video = torch.from_numpy(feedback_video).permute(3, 0, 1, 2).float() / 255.
+        output_path = f"output/pusht_expert_env_{ITERATION}_feedback.mp4"
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        log.info(f"Saving feedback video to: {output_path}")
+        save_image_or_video(feedback_video, output_path, fps=save_fps)
+        log.success(f"Successfully saved video to: {output_path}")
+
+    print("[DEBUG] pusht_api: out_action:", out_action.shape, out_action.min(), out_action.max(),
           "out_video:", out_video.shape, out_video.min(), out_video.max())
     LAST_OUT_ACTION = out_action.copy()
     CALLED_TIMES += 1

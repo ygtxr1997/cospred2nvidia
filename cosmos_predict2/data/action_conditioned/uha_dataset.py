@@ -137,11 +137,10 @@ class DdpTfBroadcastDataset(IterableDataset):
     然后仅对 batch 维（=B_super）切片，保证各 rank 样本互斥且不会破坏非 batch 张量。
     """
 
-    def __init__(self, tf_dataloader, tf_iterator, first_batch,
-                 rank, world_size, batch_size, collate_fn=None):
+    def __init__(self, tf_dataloader, tf_iterator, first_batch, rank, world_size, batch_size, collate_fn=None):
         self.tf_dataloader = tf_dataloader
-        self.tf_iterator = tf_iterator
-        self.first_batch = first_batch
+        self.tf_iterator = tf_iterator           # 不再跨 epoch 复用
+        self.first_batch = first_batch           # 仅首个 epoch 的第 0 个 step 用一次
         self.rank = rank
         self.world_size = world_size
         self.batch_size = batch_size
@@ -153,6 +152,7 @@ class DdpTfBroadcastDataset(IterableDataset):
         # 在第一次迭代后会设置
         self._receiver_template = None
         self._meta_spec = None
+        self._first_batch_consumed = False
 
         if self.is_main_rank:
             self.stream = torch.cuda.Stream()
@@ -293,19 +293,34 @@ class DdpTfBroadcastDataset(IterableDataset):
         rank = self.rank
         print(f"[INFO] Rank {rank} starting iteration with {num_iterations} batches")
 
-        iterator = self.tf_iterator
+        # ===== 每个 epoch 重新创建 iterator，并重置 meta 同步 =====
+        if self.is_main_rank:
+            iterator = iter(self.tf_dataloader)   # 重新拿一个新的迭代器（很关键）
+        else:
+            iterator = None
+
+        # 每个 epoch 强制重新广播一次 meta
+        self._meta_spec = None
 
         for i in range(num_iterations):
             if i % 100 == 0 or i < 3:
                 print(f"[DEBUG] Rank {rank} - Iteration {i}/{num_iterations}")
 
-            # --- 准备 super_batch ---
+            # ---------- Rank 0：取 super_batch ----------
             if self.is_main_rank:
                 # 取 batch（首个迭代复用提前取好的 first_batch）
                 if i == 0 and self.first_batch is not None:
                     super_batch = self.first_batch
+                    self._first_batch_consumed = True
+                    # 防止下一轮 epoch 再次复用
+                    # （也可以在 epoch 结束时清空，但这里更直接）
                 else:
-                    super_batch = next(iterator)
+                    try:
+                        super_batch = next(iterator)
+                    except StopIteration:
+                        # 某些底层 loader（TF 管道）迭代耗尽后需要重建
+                        iterator = iter(self.tf_dataloader)
+                        super_batch = next(iterator)
 
                 # 应用 collate
                 if self.collate_fn:
@@ -316,7 +331,7 @@ class DdpTfBroadcastDataset(IterableDataset):
                     super_batch = self._move_to_cuda(super_batch)
                 torch.cuda.current_stream().wait_stream(self.stream)
 
-                # 在 i==0 时生成并广播 meta
+                # i==0：广播 meta（结构/形状/dtype）
                 if i == 0:
                     self._meta_spec = self._pack_meta(super_batch)
                     meta_obj = [self._meta_spec]
@@ -326,9 +341,7 @@ class DdpTfBroadcastDataset(IterableDataset):
                     meta_obj = [None]
                     dist.broadcast_object_list(meta_obj, src=0)
 
-                # 主进程已有真实数据，无需分配模板
-                pass
-
+            # ---------- 其他 rank：接 meta & 建模板 ----------
             else:
                 # 非主进程：首轮先接 meta 再建模板
                 meta_obj = [None]
@@ -342,10 +355,10 @@ class DdpTfBroadcastDataset(IterableDataset):
                 # 每轮克隆一个空模板来接收实际数据
                 super_batch = self._clone_empty_like(self._receiver_template)
 
-            # --- 真正广播所有叶子 ---
+            # ---------- 广播实际数据 ----------
             super_batch = self._broadcast_batch_recursive(super_batch, self._meta_spec, src=0)
 
-            # --- 切片并 yield ---
+            # ---------- 仅切 batch 维 ----------
             start_idx = rank * self.batch_size
             end_idx = start_idx + self.batch_size
             local_batch = self._slice_batch(super_batch, start_idx, end_idx)
@@ -504,13 +517,21 @@ class OxeUhaDataModule(object):
                     view_videos.append(
                         batch[key][video_key].to(torch.uint8).permute(0, 2, 1, 3, 4)
                     )
-                    del batch[key][video_key]  # 尽早删除以释放内存
+                    # del batch[key][video_key]  # 尽早删除以释放内存  # do not, will be automatically released after function ends
 
             if view_videos:
                 # 拼接当前视图的所有时间步并添加到主列表
                 video_list.append(torch.cat(view_videos, dim=2))
 
         # 沿时间维度拼接所有视图
+        if not video_list:
+            keys_obs = list(batch.get("observation", {}).keys()) if isinstance(batch.get("observation"),
+                                                                               dict) else batch.get("observation",
+                                                                                                    type(None))
+            keys_future = list(batch.get("future_frames", {}).keys()) if isinstance(batch.get("future_frames"),
+                                                                                    dict) else batch.get(
+                "future_frames", type(None))
+            raise RuntimeError(f"No video tensors found. observation keys={keys_obs}, future_frames keys={keys_future}")
         concatenated_video = torch.cat(video_list, dim=2)
         del video_list  # 清理列表
 
@@ -726,10 +747,9 @@ class OxeUhaDataModule(object):
 
             return DataLoader(
                 dataset=broadcast_dataset,
-                batch_size=None,
+                batch_size=None,  # cannot set drop_last=True when batch_size is None
                 num_workers=0,
-                pin_memory=True,
-                drop_last=True,
+                pin_memory=False,  # cannot pin_memory when batch_size is None
                 collate_fn=lambda x: x[0] if isinstance(x, list) else x,
             )
         else:

@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Union, List, Tuple
 import copy
 
 import numpy as np
@@ -37,6 +37,10 @@ class BaseImageDataset(torch.utils.data.Dataset):
 
 
 class PushTImageDataset(BaseImageDataset):
+    VIEW_CHOICES = ["agentview_rgb", ]
+    CAMERA_TO_VIEW_ID = {
+        "agentview_rgb": 0,
+    }
     def __init__(self,
                  zarr_path,
                  max_obs=5,
@@ -47,8 +51,17 @@ class PushTImageDataset(BaseImageDataset):
                  val_ratio=0.0,
                  max_train_episodes=None,
                  out_resize=(256, 256),
+                 # multi-view related
+                 camera_keys: Union[List[str], Tuple[str]] = ("agentview_rgb",),
+                 # each in `agentview_rgb`, `eye_in_hand_rgb`
+                 p_camera_drop: float = 0.0,
                  ):
         super().__init__()
+        assert len(camera_keys) == 1, "Only support single view for now."
+        for camera_key in camera_keys:
+            assert camera_key in self.VIEW_CHOICES, f"camera_key must be in {self.VIEW_CHOICES}"
+
+        print("[DEBUG] PushTImageDataset init, loading zarr from:", zarr_path)
         self.replay_buffer = ReplayBuffer.copy_from_path(
             zarr_path, keys=['img', 'state', 'action'])
         val_mask = get_val_mask(
@@ -71,6 +84,8 @@ class PushTImageDataset(BaseImageDataset):
 
         self.pad_before = max_obs - 1
         self.pad_after = pad_after
+        self.horizon = self.max_seq_len  # n_v_cond + n_v_out
+        self.state_t = 1 + (self.max_seq_len - 1) // 4  # 33->9, 17->5
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
             sequence_length=self.max_seq_len,
@@ -80,9 +95,12 @@ class PushTImageDataset(BaseImageDataset):
         self.train_mask = train_mask
 
         self.out_resize = out_resize
+        self.camera_keys = camera_keys
+        self.p_camera_drop = p_camera_drop
         print(f"[PushTImageDataset] Loaded from: {zarr_path}, len={self.__len__()}. "
               f"max_obs={self.max_obs}, max_act_out={max_act_out}, "
-              f"seq_len={self.max_seq_len}, pad_before={self.pad_before}, ")
+              f"seq_len={self.max_seq_len}, pad_before={self.pad_before}, "
+              f"num_episodes={self.replay_buffer.n_episodes}, ")
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -143,6 +161,12 @@ class PushTImageDataset(BaseImageDataset):
         #       "agent_pos:", agent_pos.shape, agent_pos.dtype, agent_pos.min(), agent_pos.max(),
         #       "action:", action.shape, action.dtype, action.min(), action.max())
 
+        # Check the view choice
+        ret_n_views = len(self.camera_keys)
+        view_indices_selection = [self.CAMERA_TO_VIEW_ID[camera_key] for camera_key in self.camera_keys]
+        view_indices_t = torch.tensor(view_indices_selection).repeat_interleave(self.horizon)
+        latent_view_indices_t = torch.tensor(view_indices_selection).repeat_interleave(self.state_t)
+
         # Dataset returns all, we will sample condition and output in the training_step
         ret_video = image  # (3,v_cond+v_out,256,256)
         ret_action = action
@@ -165,6 +189,9 @@ class PushTImageDataset(BaseImageDataset):
             "padding_mask": torch.zeros(1, 256, 256),  # (T,H,W) not used; cond mask is set in conditioner
             # "num_conditional_frames": n_v_cond,  # different across in a single batch
             # "num_conditional_actions": n_a_cond,
+            "sample_n_views": ret_n_views,
+            "view_indices": view_indices_t,
+            "latent_view_indices_B_T": latent_view_indices_t,  # here is (T,), but will be (B,T) in DataLoader
         }
         return remapped_data
 

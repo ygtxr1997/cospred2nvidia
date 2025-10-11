@@ -362,9 +362,9 @@ def process_single_generation(
 
             video, out_action = pipe(
                 # first_frame,
-                in_frames,  # a1=v1+v2-1, v1=1, v2=12
-                actions[action_start: action_end] * 0.,  # zero out gt actions
-                agent_pos[v_cond_start: v_cond_end],  # robot states, as observation
+                in_frames,  # T=v1+v2
+                actions[action_start: action_end] * 0.,  # H=v2, zero out gt actions
+                agent_pos[v_cond_start: v_cond_end],  # v1, robot states, as observation
                 # np.zeros_like(actions[action_start : action_end]),  # chunk_size=(v1+v2)+a2, zero out gt actions
                 prompt=t5_embeddings,  # (512,1024), in bf16
                 num_conditional_frames=chunk_max_obs,

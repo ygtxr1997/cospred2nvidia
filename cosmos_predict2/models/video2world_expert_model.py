@@ -197,14 +197,14 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
         action_pred_mse_B_T_D = (action0_B_T_D - model_pred.action0) ** 2
         action_edm_loss_B_T_D = action_pred_mse_B_T_D * rearrange(weights_per_sigma_B_T, "b t -> b t 1")
 
-        # # DEBUG: visualize the action prediction
-        # save_action_as_image(action0_B_T_D[0].detach().float().detach().cpu().numpy(), "output/tmp_action0.png")
-        # save_action_as_image(model_pred.action0[0].detach().float().cpu().numpy(), "output/tmp_action0_pred.png")
-        # vis_x0_in = self.pipe.decode(x0_B_C_T_H_W[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
-        # vis_x0_pred = self.pipe.decode(model_pred.x0[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
-        # save_image_or_video(vis_x0_in[0, :3].detach().cpu(), "output/tmp_x0.mp4", fps=5)
-        # save_image_or_video(vis_x0_pred[0, :3].detach().cpu(), "output/tmp_x0_pred.mp4", fps=5)
-        # exit()
+        ## DEBUG: visualize the action prediction
+        save_action_as_image(action0_B_T_D[0, :, :3].detach().float().detach().cpu().numpy(), "output/tmp_action0.png")
+        save_action_as_image(model_pred.action0[0, :, :3].detach().float().cpu().numpy(), "output/tmp_action0_pred.png")
+        vis_x0_in = self.pipe.decode(x0_B_C_T_H_W[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
+        vis_x0_pred = self.pipe.decode(model_pred.x0[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
+        save_image_or_video(vis_x0_in[0, :3].detach().cpu(), "output/tmp_x0.mp4", fps=5)
+        save_image_or_video(vis_x0_pred[0, :3].detach().cpu(), "output/tmp_x0_pred.mp4", fps=5)
+        exit()
 
         kendall_loss = edm_loss_B_C_T_H_W
         action_kendall_loss = action_edm_loss_B_T_D
