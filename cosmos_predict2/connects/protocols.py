@@ -15,9 +15,10 @@ class StepRequestFromEvaluator(pydantic.BaseModel):
     """
     Sent from evaluator to policy. All data are unnormalized/raw.
 
-        gt_video (B,Ts,H,W,3) uint8 \n
-        tcp_state: (B,Ts,D) float32, optional \n
-        stage_flag: 0:cold start, 1:hot start \n
+    Attributes:
+        gt_video: (B,Ts,H,W,3) uint8
+        tcp_state: (B,Ts,D) float32, optional
+        stage_flag: 0:cold start, 1:hot start
         instruction: str
     """
     instruction: str
@@ -90,7 +91,8 @@ class StepRequestFromPolicy(pydantic.BaseModel):
     """
     Sent from policy to evaluator. Action should be unnormalized/raw.
 
-        action: (B,v2,D) float32 \n
+    Attributes:
+        action: (B,v2,D) float32
         max_cache_action: int, optional, tell evaluator how many actions to cache, None means
     """
 

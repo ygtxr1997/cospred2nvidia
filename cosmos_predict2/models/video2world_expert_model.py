@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 
 from typing import Tuple, Dict, Any
 import math
@@ -33,7 +34,9 @@ from imaginaire.utils import log
 
 
 class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
-    def __init__(self, config: Predict2Video2WorldModelConfig):
+    def __init__(self, config: Predict2Video2WorldModelConfig,
+                 load_ema: bool = False,  # used in inference api
+                 ):
         super(ImaginaireModel, self).__init__()
 
         self.config = config
@@ -69,6 +72,7 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
         self.pipe: Video2WorldExpertPipeline = Video2WorldExpertPipeline.from_config(
             config.pipe_config,
             dit_path=config.model_manager_config.dit_path,
+            load_ema_to_reg=load_ema,
         )
 
         self.freeze_parameters()
@@ -198,13 +202,16 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
         action_edm_loss_B_T_D = action_pred_mse_B_T_D * rearrange(weights_per_sigma_B_T, "b t -> b t 1")
 
         ## DEBUG: visualize the action prediction
-        save_action_as_image(action0_B_T_D[0, :, :3].detach().float().detach().cpu().numpy(), "output/tmp_action0.png")
-        save_action_as_image(model_pred.action0[0, :, :3].detach().float().cpu().numpy(), "output/tmp_action0_pred.png")
-        vis_x0_in = self.pipe.decode(x0_B_C_T_H_W[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
-        vis_x0_pred = self.pipe.decode(model_pred.x0[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
-        save_image_or_video(vis_x0_in[0, :3].detach().cpu(), "output/tmp_x0.mp4", fps=5)
-        save_image_or_video(vis_x0_pred[0, :3].detach().cpu(), "output/tmp_x0_pred.mp4", fps=5)
-        exit()
+        # import torch.distributed as dist
+        # if os.environ.get("LOCAL_RANK", "0") == "0":
+        #     save_action_as_image(action0_B_T_D[0, :, :3].detach().float().detach().cpu().numpy(), "output/tmp_action0.png")
+        #     save_action_as_image(model_pred.action0[0, :, :3].detach().float().cpu().numpy(), "output/tmp_action0_pred.png")
+        #     vis_x0_in = self.pipe.decode(x0_B_C_T_H_W[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
+        #     vis_x0_pred = self.pipe.decode(model_pred.x0[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
+        #     save_image_or_video(vis_x0_in[0, :3].detach().cpu(), "output/tmp_x0.mp4", fps=15)
+        #     save_image_or_video(vis_x0_pred[0, :3].detach().cpu(), "output/tmp_x0_pred.mp4", fps=15)
+        # dist.barrier()
+        # exit()
 
         kendall_loss = edm_loss_B_C_T_H_W
         action_kendall_loss = action_edm_loss_B_T_D
@@ -229,6 +236,9 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
             "kendall_loss": kendall_loss,
             "action_kendall_loss": action_kendall_loss,
         }
+        # print("[DEBUG] compute_loss_with_epsilon_and_sigma:",
+        #       "video_mse:", output_batch["mse_loss"].item(),
+        #       "action_mse:", output_batch["action_mse_loss"].item(),)
 
         return output_batch, kendall_loss_dict, pred_mse_B_C_T_H_W, edm_loss_B_C_T_H_W
 

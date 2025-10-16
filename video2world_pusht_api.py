@@ -16,7 +16,10 @@ import json
 import torch
 from torchvision.transforms import transforms
 
-from cosmos_predict2.configs.expert.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT
+from cosmos_predict2.configs.base.config import Config
+from cosmos_predict2.models.video2world_model import Predict2ModelManagerConfig
+from cosmos_predict2.models.video2world_expert_model import Predict2Video2WorldExpertModel, Predict2Video2WorldModelConfig
+from cosmos_predict2.configs.expert.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT, Video2WorldExpertPipelineConfig
 from cosmos_predict2.pipelines.video2world_expert import Video2WorldExpertPipeline
 from cosmos_predict2.data.action_conditioned.pusht_dataset import PushTImageDataset
 
@@ -26,12 +29,16 @@ from cosmos_predict2.utils.ckpt_load_helpers import load_config_from_checkpoint_
 from cosmos_predict2.connects.protocols import StepRequestFromEvaluator, StepRequestFromPolicy
 from cosmos_predict2.connects.utils import get_frames_from_multiview_video, cat_multiview_video_with_zeros
 
-
-from imaginaire.utils import distributed, log, misc
+from imaginaire.lazy_config import instantiate
+from imaginaire.lazy_config import LazyCall as L
+from imaginaire.utils import callback, distributed, log, misc
 from imaginaire.utils.io import save_image_or_video
+from cosmos_predict2.utils.printer import print_batch
 
 
 """ How to use me?
+conda activate cosmos-predict2
+cd ~/code/cospred2nvidia/
 export PYTHONPATH=~/code/cospred2nvidia/
 CUDA_VISIBLE_DEVICES=6 uvicorn video2world_pusht_api:gpu_app --port 6060
 """
@@ -52,9 +59,25 @@ INPUT_DATASET_PATH = f"{COSMOS_ROOT}/datasets/pusht/pusht_256_val.zarr"
 INPUT_DATASET_INDICES = (300, 100, 0)
 INPUT_VIDEO_FRAME_INDEX = 0
 
+ONLINE_ITERATION = 0
+MAX_ONLINE_ITERATION = 1000
+
+## rainbow
+# hyper_params = {
+#     'lr': 2 ** (-15),  # ori: 2 ** (-15)
+#     'f_max': 0.1,  # ori: 0.17
+#     'weight_decay': 0.1,  # ori: 0.01
+# }
+## light
+hyper_params = {
+    'lr': 2 ** (-16),  # ori: 2 ** (-15)
+    'f_max': 0.1,  # ori: 0.17
+    'weight_decay': 0.1,  # ori: 0.01
+}
+
 
 @lru_cache()
-def get_agent(device: str):
+def get_agent(device: str) -> Dict[str, Any]:
     args = OmegaConf.create({
         "model_size": "2B",
         "dit_path": f"{COSMOS_ROOT}/checkpoints/cosmos_predict2/debug/cospred2_2b_expert_pusht_{MODEL_TIME}/checkpoints/model/iter_{ITERATION}.pt",
@@ -68,14 +91,7 @@ def get_agent(device: str):
         "load_ema": LOAD_EMA,
     })
 
-    config_dict, config_path = load_config_from_checkpoint_dir(args.dit_path)
-    log.info(f"Loading config from: {config_path}")
-    pipe_config, dataset_config = create_config_from_checkpoint(config_dict)
-    log.info("Successfully created config from checkpoint file")
-
-    dit_path = args.dit_path
-    text_encoder_path = ""  # PushT doesn't use text encoder
-
+    # [] Random seed and cuDNN settings.
     misc.set_random_seed(seed=args.seed, by_rank=True)
     # Initialize cuDNN.
     torch.backends.cudnn.deterministic = False
@@ -84,19 +100,78 @@ def get_agent(device: str):
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Load models
-    log.info(f"Initializing Video2WorldPipeline with model size: {args.model_size}")
-    pipe = Video2WorldExpertPipeline.from_config(
-        config=pipe_config,
-        dit_path=dit_path,
-        text_encoder_path=text_encoder_path,
-        device=device,
-        torch_dtype=torch.bfloat16,
-        load_ema_to_reg=args.load_ema,
-        # load_prompt_refiner=True,
-    )
+    # [] Load original config from the checkpoint file
+    config_dict, config_path = load_config_from_checkpoint_dir(args.dit_path)
+    log.info(f"Loading config from: {config_path}")
+    pipe_config, dataset_config = create_config_from_checkpoint(config_dict)
+    log.info("Successfully created config from checkpoint file")
 
-    return pipe, args, dit_path
+    # [] Modify the config based on input args
+    # config_dict.keys: 'model', 'optimizer', 'scheduler', 'dataloader_train', 'dataloader_val', 'job',
+    #   'trainer', 'model_parallel', 'checkpoint', 'defaults', '_is_frozen'
+    global hyper_params
+    config_dict: Config
+    config_dict.model.config: Predict2Video2WorldModelConfig
+    config_dict.model.config.pipe_config: Video2WorldExpertPipelineConfig
+    config_dict.model.config.model_manager_config: Predict2ModelManagerConfig
+
+    text_encoder_path = ""  # PushT doesn't use text encoder
+
+    config_dict.model.config.train_architecture = "lora"  # ori: "base"
+    config_dict.model.config.model_manager_config.dit_path = args.dit_path
+    config_dict.model.config.model_manager_config.text_encoder_path = text_encoder_path  # PushT doesn't use text encoder
+    config_dict.optimizer.lr = hyper_params['lr']  # smaller lr for online update
+    config_dict.optimizer.weight_decay = hyper_params['weight_decay']
+    config_dict.scheduler.warm_up_steps = [0]  # no warm up when online update
+    config_dict.scheduler.cycle_lengths = [1000]
+    config_dict.scheduler.verbosity_interval = 10
+    config_dict.scheduler.f_start = [1e-6]
+    config_dict.scheduler.f_max = [hyper_params['f_max']]  # ori:0.17
+    config_dict.scheduler.f_min = config_dict.scheduler.f_max
+    config_dict.model.config.pipe_config.p_all_actions_as_condition = 1.  # no action as condition during online update
+    log.info("Config has been updated for inference and online update.")
+
+    # [] Create trainable model and move to device
+    log.info(f"Initializing Video2WorldPipeline with model size: {args.model_size}")
+    model: Predict2Video2WorldExpertModel = instantiate(
+        config_dict.model,
+        load_ema=args.load_ema,
+    )  # will call pipeline.from_config()
+    model = model.to(device, memory_format=config_dict.trainer.memory_format)
+    for module in [model.net, model.pipe.tokenizer]:
+        if module is not None:
+            module.to(memory_format=config_dict.trainer.memory_format, device=device, dtype=torch.bfloat16)
+
+    # [] Initialize the optimizer, lr_scheduler, and grad_scaler.
+    optimizer, scheduler = model.init_optimizer_scheduler(config_dict.optimizer, config_dict.scheduler)
+    grad_scaler = torch.amp.GradScaler("cuda", **config_dict.trainer.grad_scaler_args)
+    log.info("Initialized the optimizer and scheduler.")
+    print(type(model))
+
+    # [] Load the model checkpoint and get the starting iteration number.
+    # NOTE: if we don't save the model weights, we can skip this step.
+
+    # [] Create a DDP model wrapper.
+    # NOTE: DDP or FSDP is not supported yet. We use single GPU for online update.
+
+    # [] Check inference related settings.
+    print("[DEBUG] pipe.scheduler:", type(model.pipe.scheduler))
+    print("[DEBUG] pipe.scaling:", type(model.pipe.scaling))
+    print("[DEBUG] pipe.tokenizer:", type(model.pipe.tokenizer))
+    print("[DEBUG] pipe.conditioner:", type(model.pipe.conditioner))
+
+    # [] Initialize for online update
+    model.pipe.init_for_online_update(max_batches=1)
+
+    return {
+        "model": model,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "grad_scaler": grad_scaler,
+        "args": args,
+        "args.dit_path": args.dit_path,
+    }
+    # Return `model` instead of `pipe` to support online updatze
 
 
 @gpu_app.get("/")
@@ -111,14 +186,30 @@ def model_init():
 
 @gpu_app.get("/reset")
 def model_reset():
-    agent, image_shape, _ = get_agent("cuda")
+    agent = get_agent("cuda")["model"]
     # agent.reset()
     return {"max_cache_action": max_cache_action}
 
 
+def mem(tag=""):
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / 1024**2
+    reserv = torch.cuda.memory_reserved() / 1024**2
+    peak = torch.cuda.max_memory_allocated() / 1024**2
+    # print(f"[MEM]{tag:>12s} | alloc={alloc:.1f}MB reserved={reserv:.1f}MB peak={peak:.1f}MB")
+    torch.cuda.reset_peak_memory_stats()
+
+
 @gpu_app.post("/step")
 def model_step(step_request: StepRequestFromEvaluator) -> Dict:
-    agent, args, weight_path = get_agent("cuda")  # shape:[C,H,W]
+    agent_and_others = get_agent("cuda")
+    agent = agent_and_others["model"]
+    optimizer = agent_and_others["optimizer"]
+    scheduler = agent_and_others["scheduler"]
+    grad_scaler = agent_and_others["grad_scaler"]
+    args = agent_and_others["args"]
+    weight_path = agent_and_others["args.dit_path"]
+    # agent, args, weight_path = get_agent("cuda")  # agent is a `Predict2Video2WorldExpertModel` object
     print("[video2world_pusht_api] Using cached ckpt from: None. Model type:", type(agent), weight_path)
 
     # parse input observation
@@ -127,7 +218,7 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
     stage_flag = step_data["stage_flag"]
     gt_video = step_data["gt_video"]  # (B,V*Ts,H,W,3) uint8, Ts can be larger than v1
     tcp_state = step_data["tcp_state"]  # (B,Ts,D) float32 or None
-    n_cameras = agent.config.net.n_cameras_emb
+    n_cameras = agent.pipe.config.net.n_cameras_emb
 
     # o o o o o o o o o ; o o o o o o o o o |       V*Ts, V=2, multi-view obs returned by evaluator
     # o o o o o o o o o ;                           Ts=9, length of a single view
@@ -141,7 +232,61 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
         gt_video, sample_n_views=n_cameras, start_idx=Ts - v1, end_idx=Ts
     )  # (B,V*Ts,H,W,3) uint8 cut to (B,V*v1,H,W,3) uint8
 
+    global ONLINE_ITERATION, MAX_ONLINE_ITERATION, hyper_params
     if stage_flag == 0:  # cold start
+        pass  # do not update model
+    elif ONLINE_ITERATION < MAX_ONLINE_ITERATION:  # hot start
+        assert stage_flag == 1, "stage_flag should be 1 in hot start"
+        # State II. Online update the model using GT frames (input + output) + actions (input)
+        # a. set model to train mode
+        if not agent.training:
+            agent.train()
+        # b. prepare training data
+        online_data_batch = agent.pipe.get_data_batch_for_online_update(
+            torch.from_numpy(gt_video).permute(0, 4, 1, 2, 3),  # (B,C,V*Ts,H,W) uint8 in [0,255]
+        )
+        # print_batch("online_data_batch", online_data_batch)
+        save_image_or_video(
+            (online_data_batch["video"].float() / 255.)[0],  # (B,C,T,H,W) float32 in [0,1]
+            f"output/pusht_online_input_{ITERATION}_{CALLED_TIMES:03d}.mp4",
+            fps=10
+        )
+
+        # c. training step
+        online_update_steps_per_feedback = 2
+        config_grad_accum_steps = 2
+
+        for _ in range(online_update_steps_per_feedback):
+            mem("before online step")
+            with distributed.ddp_sync_grad(agent, (ONLINE_ITERATION + 1) % config_grad_accum_steps == 0):
+                output_batch, loss = agent.training_step(online_data_batch, ONLINE_ITERATION)
+                mem("after online step")
+                loss_scaled = grad_scaler.scale(loss / 1)
+                print("[DEBUG] online update: iteration, loss:", ONLINE_ITERATION, loss.item())
+                loss_scaled.backward()
+                mem("after backward")
+            ONLINE_ITERATION += 1
+            # d. optimizer, scheduler step
+            if ONLINE_ITERATION % config_grad_accum_steps == 0:
+                grad_scaler.step(optimizer)
+                mem("after grad_scaler step")
+                grad_scaler.update()
+                scheduler.step()
+                agent.on_before_zero_grad(optimizer, scheduler, iteration=ONLINE_ITERATION)
+                optimizer.zero_grad(set_to_none=True)
+                mem("after optim zero_grad")
+                # e. update ema shadow weights
+                if agent.pipe.dit_ema_bf16 is not None:
+                    agent.pipe.online_update_ema_bf16()
+                    mem("after online_update_ema_bf16")
+        # f. set model back to eval mode
+        if agent.training:
+            agent.eval()
+        # g. print hyper params
+        if ONLINE_ITERATION % 10 == 0:
+            print('[DEBUG] hyper params:', hyper_params)
+
+    if True or stage_flag == 0:  # cold start
         assert Ts >= v1, f"Only support Ts>=v1 in cold start, got Ts={Ts}, v1={v1}"
 
         # Stage I. Frames -> Actions
@@ -151,7 +296,7 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
         in_frames = cat_multiview_video_with_zeros(
             in_cond, sample_n_views=n_cameras, zero_length=max_cache_action
         )  # (B,V*(v1+a),H,W,3) uint8
-        in_actions = np.zeros((B, max_cache_action, agent.config.net.action_dof), dtype=np.float32)  # (B,a,2) float32, in [-1,1]
+        in_actions = np.zeros((B, max_cache_action, agent.pipe.config.net.action_dof), dtype=np.float32)  # (B,a,2) float32, in [-1,1]
         # in_robot_states = dataset.norm_agent_pos(torch.from_numpy(tcp_state[:, -v1:])).numpy()
         in_robot_states = (tcp_state[:, -v1:] / 256.) - 1.  # [0,512] -> [-1,1]
         print("[DEBUG] expert_api: in_frames:", in_frames.shape, in_frames.min(), in_frames.max(),
@@ -162,7 +307,7 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
             f"output/pusht_env_{ITERATION}_{CALLED_TIMES:03d}.mp4",
             fps=10
         )
-        out_video, out_action = agent(
+        out_video, out_action = agent.pipe(
             in_frames,  # (B,v1+a,H,W,3) uint8
             in_actions,  # (B,a,D) float32
             in_robot_states,  # (B,v1,D) float32
@@ -172,10 +317,11 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
             guidance=args.guidance,
             seed=args.seed,
             fps=10,  # hard code fps for pusht
+            use_ema=True,  # use ema dit
         )  # out_action:(B,chunk_size,2) float32 in [-1,1]; out_video:(B,C,T,H,W) float32 in [-1,1]
         save_image_or_video(
             out_video,
-            f"output/pusht_expert_pred_{ITERATION}.mp4",
+            f"output/pusht_expert_pred_{ITERATION}_{CALLED_TIMES:03d}.mp4",
             fps=10
         )
         save_action_as_image(
@@ -206,7 +352,6 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
         # )
 
     else:  # hot start
-        raise NotImplementedError
         assert LAST_OBS_FRAME_LAST is not None and LAST_OUT_ACTION is not None, "last_out_action and last_obs_final should not be None in hot start"
         assert v2 == max_cache_action, f"Only support v2=1 (cold start) or v2=max_cache_action (hot start), got v2={v2}"
         assert LAST_OUT_ACTION.shape[1] == max_cache_action, f"Only support last_out_action.shape[1]=max_cache_action, got {LAST_OUT_ACTION.shape}"
@@ -262,7 +407,9 @@ def model_step(step_request: StepRequestFromEvaluator) -> Dict:
 
 if __name__ == "__main__":
     import time
-    agent = get_agent("cuda")
+    de_agent = get_agent("cuda")
+
+    exit()
 
     zero_rgb = np.zeros((2, 480, 848, 3), dtype=np.uint8)  # (T,H,W,C)
 

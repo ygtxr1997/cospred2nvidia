@@ -32,6 +32,9 @@ from cosmos_predict2.configs.expert.defaults.data_libero import (
 from cosmos_predict2.configs.expert.defaults.data_uha import (
     oxe_uha_train_dataloader, oxe_uha_val_dataloader
 )
+from cosmos_predict2.configs.expert.defaults.data_tcl import (
+    tcl_train_dataloader, tcl_val_dataloader
+)
 from imaginaire.lazy_config import LazyCall as L
 
 base_path = "./datasets/bridge/"
@@ -123,4 +126,17 @@ def register_training_and_val_data_expert():
         package="dataloader_val",
         name="oxe_val",
         node=oxe_uha_val_dataloader,
+    )
+
+    cs.store(
+        group="dataloader_train",
+        package="dataloader_train",
+        name="tcl_train",
+        node=tcl_train_dataloader,
+    )
+    cs.store(
+        group="dataloader_val",
+        package="dataloader_val",
+        name="tcl_val",
+        node=tcl_val_dataloader,
     )

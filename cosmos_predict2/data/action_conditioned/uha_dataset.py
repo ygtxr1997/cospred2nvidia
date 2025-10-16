@@ -458,27 +458,28 @@ class OxeUhaDataModule(object):
         cfg = self.ori_uha_cfg
         is_main_process = os.environ.get("LOCAL_RANK", "0") == "0"
 
-        ''' 1. Get dataloaders '''
-        self.ori_uha_data_module = UhaDataModuleNoValidationSet(
-            datasets=self.ori_uha_cfg['datasets'],
-            batch_size=self.ori_uha_cfg['batch_size'],
-            num_workers=self.ori_uha_cfg['num_workers'],
-            pin_memory=self.ori_uha_cfg['pin_memory'],
-            drop_last=self.ori_uha_cfg['drop_last'],
-            transforms=self.ori_uha_cfg['transforms'],
-            language_encoders=self.ori_uha_cfg['language_encoders'],
-        )
-        self.train_loader = self.ori_uha_data_module.create_train_dataloader(main_process=is_main_process)
-        # self.val_loader = self.ori_uha_data_module.create_val_dataloader()
-        self.val_loader = None
+        if is_main_process:
+            ''' 1. Get dataloaders '''
+            self.ori_uha_data_module = UhaDataModuleNoValidationSet(
+                datasets=self.ori_uha_cfg['datasets'],
+                batch_size=self.ori_uha_cfg['batch_size'],
+                num_workers=self.ori_uha_cfg['num_workers'],
+                pin_memory=self.ori_uha_cfg['pin_memory'],
+                drop_last=self.ori_uha_cfg['drop_last'],
+                transforms=self.ori_uha_cfg['transforms'],
+                language_encoders=self.ori_uha_cfg['language_encoders'],
+            )
+            self.train_loader = self.ori_uha_data_module.create_train_dataloader(main_process=is_main_process)
+            # self.val_loader = self.ori_uha_data_module.create_val_dataloader()
+            self.val_loader = None
 
-        ''' 2. Get dataset info '''
-        self.dataset_info = self.ori_uha_data_module.get_dataset_statistics()
+            ''' 2. Get dataset info '''
+            self.dataset_info = self.ori_uha_data_module.get_dataset_statistics()
 
-        print(f'[DEBUG] OxeUhaDataModule setup finished (main={is_main_process}). '
-              f'Train len={len(self.train_loader)}, '
-              # f'Val len={len(self.val_loader)}. '
-              f'Info: {self.dataset_info}')
+            print(f'[DEBUG] OxeUhaDataModule setup finished (main={is_main_process}). '
+                  f'Train len={len(self.train_loader)}, '
+                  # f'Val len={len(self.val_loader)}. '
+                  f'Info: {self.dataset_info}')
 
     def custom_collate_fn(self, batch):  # used by DataLoader
         # 如果 batch 不是列表 (例如，在 DDP 模式下，它已经是一个整理好的字典),
@@ -560,7 +561,10 @@ class OxeUhaDataModule(object):
 
 
         # 5. 提取文本嵌入
-        ret_text_embeddings = batch["task"]["language_embedding"].to(torch.bfloat16)
+        if "language_embedding" in batch["task"]:
+            ret_text_embeddings = batch["task"]["language_embedding"].to(torch.bfloat16)
+        else:
+            ret_text_embeddings = torch.zeros((B, 512, 1024), dtype=torch.bfloat16)
 
         del batch # 删除原始批处理字典
 

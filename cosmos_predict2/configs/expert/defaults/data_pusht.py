@@ -14,7 +14,7 @@ n_latent_v_cond, n_latent_v_out = 1 * 1 + 1, 1 * 5  # 1+1+5=7
 horizon = n_v_cond + n_v_out # 25
 pad_before = n_v_cond - 1
 pusht_train_dataset = L(PushTImageDataset)(
-    # zarr_path="./datasets/pusht/pusht_cchi_v7_replay.zarr",
+    # zarr_path="/home/geyuan/code/cospred2nvidia/datasets/pusht/pusht_cchi_v7_replay.zarr",
     zarr_path="/home/geyuan/code/cospred2nvidia/datasets/pusht/pusht_256.zarr",
     # zarr_path="./datasets/pusht/pusht_256_val.zarr",
     max_obs=n_v_cond,

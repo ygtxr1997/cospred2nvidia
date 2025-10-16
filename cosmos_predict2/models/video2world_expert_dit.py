@@ -826,6 +826,31 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             self.agent_pos_action_embedder_B_D.init_weights()
             self.agent_pos_action_embedder_B_3D.init_weights()
 
+    def freeze_expert(self) -> None:
+        total_params = 0
+        expert_params = 0
+        base_params = 0
+
+        for name, param in self.named_parameters():
+            param_count = param.numel()
+
+            if param.requires_grad:
+                total_params += param_count
+            else:
+                continue
+
+            if ('ex_' in name or 'expert' in name
+                    or 'action' in name or 'agent_pos' in name
+                    or 'view_embeddings' in name):
+                expert_params += param.numel()
+                param.requires_grad = False
+            else:
+                base_params += param.numel()
+        print(f"[DEBUG] [ExpertMinimalV1LVGDiT] Freeze Expert: "
+              f"total_params trainable: {total_params / 1_000_000:.2f}M, "
+              f"expert_params trainable->frozen: {expert_params / 1_000_000:.2f}M, "
+              f"base_params trainable: {base_params / 1_000_000:.2f}M")
+
     def count_parameters(self) -> int:
         total_params = 0
         trainable_params = 0

@@ -193,12 +193,10 @@ def create_config_from_checkpoint(config_dict) -> Tuple[Video2WorldExpertPipelin
                 log.info("Successfully loaded pipe_config from pkl file")
                 return pipe_config, dataset_config
             else:
-                log.warning(f"Loaded pipe_config type: {type(pipe_config)}, attempting conversion")
-                # 如果不是预期类型，尝试转换
                 if hasattr(pipe_config, '__dict__'):
                     return pipe_config, dataset_config
                 else:
-                    raise ValueError(f"Cannot convert pipe_config of type {type(pipe_config)}")
+                    raise ValueError(f"Cannot process pipe_config of type {type(pipe_config)}")
         else:
             raise ValueError("Expected config structure not found in loaded config")
 

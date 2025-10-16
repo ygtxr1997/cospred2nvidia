@@ -10,13 +10,13 @@ import numpy as np
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
 from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
-from cosmos_predict2.data.action_conditioned.uha_dataset import OxeUhaDataModule
-from cosmos_predict2.configs.expert.defaults.data_uha import uha_datamodule
+from cosmos_predict2.configs.expert.defaults.data_tcl import tcl_train_dataset, DataLoader
+from imaginaire.lazy_config import instantiate
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute T5 embeddings for text prompts")
-    parser.add_argument("-d", "--dataset_name", type=str, default="example", help="Dataset mix name")
+    parser.add_argument("-d", "--dataset_name", type=str, default="1009_spoon_pick_place", help="Date + Task name")
     parser.add_argument("--max_length", type=int, default=512, help="Maximum length of the text embedding")
     parser.add_argument(
         "--cache_dir", type=str, default="checkpoints/google-t5/t5-11b", help="Directory to cache the T5 model"
@@ -72,7 +72,8 @@ def extract_lang_embeddings_with_t5(
         ori_data_name: str,  # mixed dataset name (`fractal`), rather than the directory name (`fractal20220817_data`)
         text_to_t5_embedding_func: Callable,
         save_to_dir: str = None,
-        force_rebuild: bool = False
+        force_rebuild: bool = False,
+        h5_suffix: str = "_240p",
 ):
     if save_to_dir is None:
         save_to_dir = os.path.join(ori_data_path, "lang_emb_t5xxl", ori_data_name)
@@ -85,31 +86,24 @@ def extract_lang_embeddings_with_t5(
         print(f"T5XXL language embeddings already exists: {embeddings_file}")
         return save_to_dir
 
-    print(f"Extracting T5 embeddings from {ori_data_path} to {save_to_dir} ...")
-
     # 1. Load dataset and dataloader
-    uha_datamodule['datasets']['DATA_PATH'] = ori_data_path
-    uha_datamodule['datasets']['DATA_NAME'] = ori_data_name
-    uha_datamodule['datasets']['load_camera_views'] = ['primary']  # to speed up
-    uha_datamodule['datasets']['interleaved_dataset_cfg'] = {
-        'shuffle_buffer_size': 10000,
-        'traj_transform_kwargs': {
-            'window_size': 1,
-            'action_horizon': 1,
-        }
-    }  # use single-frame to speed up
-    uha_datamodule['datasets']['load_language_embeddings'] = False  # we will compute them ourselves
-    uha_datamodule['batch_size'] = 256
-    uha_datamodule['drop_last'] = False
-    uha_datamodule['use_ori_uha_data_collate'] = True  # should be False
+    tcl_train_dataset['data_root'] = os.path.join(ori_data_path, ori_data_name)  # dir containing `date/*.npz`
+    tcl_train_dataset['h5_path'] = os.path.join(ori_data_path, "hdf5", f"{ori_data_name}{h5_suffix}.h5")  # h5 file path
+    tcl_train_dataset['camera_keys'] = ['image']  # to speed up
+    tcl_train_dataset['language_emb_model'] = ''  # we will compute them ourselves
 
-    uha_data = OxeUhaDataModule(**uha_datamodule)
-    uha_data.prepare_data()
-    uha_data.setup()
-    train_dataloader = uha_data.train_dataloader()
-    val_dataloader = uha_data.val_dataloader()
+    print(f"Extracting T5 embeddings from {tcl_train_dataset['data_root']} to {save_to_dir} ...")
 
-    print('[DEBUG] dataloader lens:', len(train_dataloader), len(val_dataloader))
+    train_dataset = instantiate(tcl_train_dataset)
+    train_dataloader = DataLoader(
+        dataset=train_dataset,
+        batch_size=128,
+        shuffle=False,
+        num_workers=16,
+        drop_last=False  # , coll
+    )
+
+    print('[DEBUG] dataloader lens:', len(train_dataloader))
 
     # 2. 计算 T5 embeddings（同时处理train和val）
     map_text_to_embeddings: Dict[str, np.ndarray] = {}
@@ -124,7 +118,7 @@ def extract_lang_embeddings_with_t5(
     # 处理训练数据
     print("Processing training data...")
     for idx, batch in enumerate(tqdm(train_dataloader, desc="Train")):
-        language_instructions = batch['task']['language_instruction']  # List[str]
+        language_instructions = batch['lang_text']  # List[str]
 
         for text in language_instructions:
             if text not in unique_texts:
@@ -148,28 +142,8 @@ def extract_lang_embeddings_with_t5(
             break  # 仅处理一个epoch
 
     # 处理验证数据
-    # NOTE: in RLDSIterableDataset, val dataloader is same as train dataloader, so skip val here
+    # NOTE: skip val here
     print("Processing validation data...")
-    # for idx, batch in enumerate(tqdm(val_dataloader, desc="Val")):
-    #     language_instructions = batch['task']['language_instruction']  # List[str]
-    #
-    #     for text in language_instructions:
-    #         if text not in unique_texts:
-    #             # 新文本，分配ID并计算embedding
-    #             text_id = len(unique_texts)
-    #             unique_texts[text] = text_id
-    #             unique_texts_list.append(text)
-    #
-    #             # 计算T5 embedding（保持完整形状）
-    #             full_embedding, valid_length = text_to_t5_embedding_func(text)
-    #
-    #             map_text_to_embeddings[text] = full_embedding
-    #             text_embeddings.append(full_embedding)  # (512, 1024)
-    #             text_valid_lengths.append(valid_length)
-    #         else:
-    #             text_id = unique_texts[text]
-    #
-    #         val_step_to_text_id.append(text_id)
 
     # 3. 准备保存数据
     n_unique = len(unique_texts)
@@ -275,15 +249,16 @@ if __name__ == "__main__":
 
     if not args.debug:
         extract_lang_embeddings_with_t5(
-            ori_data_path="/home/geyuan/local_soft/huggingface/v1/",
-            ori_data_name=args.dataset_name,  # `fractal`, `bridge`, `example`
+            ori_data_path="/home/geyuan/local_soft/TCL/",
+            ori_data_name=args.dataset_name,  # `1009_spoon_pick_place`,
             text_to_t5_embedding_func=text_to_t5_embedding_func,
             force_rebuild=True,
+            save_to_dir="/home/geyuan/local_soft/TCL/lang_emb_t5xxl/all/",
         )
 
     # Load and verify
     saved_data = load_t5_embeddings(
-        save_dir=f"/home/geyuan/local_soft/huggingface/v1/lang_emb_t5xxl/{args.dataset_name}"
+        save_dir=f"/home/geyuan/local_soft/TCL/lang_emb_t5xxl/all/"
     )
     print("[DEBUG] loaded data keys:", saved_data.keys())
     print("[DEBUG] mapping:", len(saved_data['text_to_embedding_map'].items()),

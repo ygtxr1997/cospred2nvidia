@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 
 def get_frames_from_multiview_video(video_B_VT_H_W_C, sample_n_views: int, start_idx=0, end_idx=None):
@@ -37,3 +38,37 @@ def cat_multiview_video_with_zeros(video_B_VT_H_W_C: np.ndarray, sample_n_views:
     # Reshape back: (V, T+zero_length, H, W, C) -> (V*(T+zero_length), H, W, C)
     result = video_with_zeros.reshape(B, V * (T + zero_length), H, W, C)
     return result
+
+
+def replace_multiview_video_back_with_another(
+        ori_video_B_C_VT_H_W: torch.Tensor,
+        new_video_B_C_VT_H_W: torch.Tensor,
+        sample_n_views: int,
+        replace_length: int,
+):
+    B, C, VT_ori, H, W = ori_video_B_C_VT_H_W.shape
+    VT_new = new_video_B_C_VT_H_W.shape[2]
+    T_ori = VT_ori // sample_n_views
+    T_new = VT_new // sample_n_views
+    V = sample_n_views
+
+    assert VT_ori == T_ori * V, \
+        f"Expected third dimension to be divisible by {V}, got {VT_ori}"
+    assert VT_new == T_new * V, \
+        f"Expected third dimension to be divisible by {V}, got {VT_new}"
+    assert replace_length <= T_ori and replace_length <= T_new, \
+        f"replace_length {replace_length} exceeds original or new video length"
+    assert ori_video_B_C_VT_H_W.shape[0] == new_video_B_C_VT_H_W.shape[0], \
+        f"Shape mismatch: {ori_video_B_C_VT_H_W.shape[0]} vs {new_video_B_C_VT_H_W.shape[0]}"
+
+    # Reshape to (B, C, V, T, H, W)
+    ori_reshaped = ori_video_B_C_VT_H_W.view(B, C, V, T_ori, H, W)
+    new_reshaped = new_video_B_C_VT_H_W.view(B, C, V, T_new, H, W)
+
+    # Replace the last `replace_length` frames along the time dimension
+    ori_reshaped[:, :, :, -replace_length:, :, :] = new_reshaped[:, :, :, -replace_length:, :, :]
+
+    # Reshape back to (B, C, V*T, H, W)
+    result = ori_reshaped.view(B, C, VT_ori, H, W)
+    return result
+

@@ -32,6 +32,7 @@ from cosmos_predict2.pipelines.video2world import ConditioningStrategy
 from cosmos_predict2.module.denoise_prediction import DenoisePredictionWithAction
 from cosmos_predict2.conditioner import ActionCondition, ActionConditioner
 from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
+from cosmos_predict2.online.data_handler import OnlineDataHandler
 from cosmos_predict2.utils.context_parallel import cat_outputs_cp, split_inputs_cp
 from cosmos_predict2.utils.vis_helpers import save_action_as_image
 from imaginaire.utils.io import save_image_or_video
@@ -50,12 +51,18 @@ NUM_CONDITIONAL_ACTIONS_KEY: str = "num_conditional_actions"
 class Video2WorldExpertPipeline(Video2WorldPipeline):
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype)
-        # action training related
+        # Action training related
         self.input_action_key: str = "action"
         self.input_agent_pos_key: str = "agent_pos"
         self.max_obs: int = 5
         self.max_act_out: int = 12
         self.p_all_actions_as_condition: float = 0.5
+
+        # Online update related
+        self.online_update_enabled = False
+        self.online_data_handler: OnlineDataHandler = None
+        # float32 ema cannot be used for bfloat16 training and inference, we need a shadow ema model for inference
+        self.dit_ema_bf16 = None
 
     @staticmethod
     def from_config(
@@ -280,6 +287,8 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             # Action related
             at_B_T_D: torch.Tensor = None,
             a_sigma: torch.Tensor = None,
+            # Online update related
+            use_ema: bool = False,
     ) -> DenoisePredictionWithAction:
         """
         Performs denoising on the input noise data, noise level, and condition
@@ -293,6 +302,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             use_cuda_graphs (bool, optional): Whether to use CUDA Graphs for inference. Defaults to False.
             at_B_T_D (torch.Tensor, optional): Action tensor of B-T values. Defaults to None.
             a_sigma (torch.Tensor, optional): Action noise level. Defaults to None.
+            use_ema (bool, optional): Whether to use Ema. Don't set as True when training.
 
         Returns:
             DenoisePredictionWithAction: The denoised prediction, it includes clean data predicton (x0), \
@@ -421,7 +431,10 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
                 )
 
         # forward pass through the network
-        net_output_B_C_T_H_W, action_B_Horizon_Dof = self.dit(
+        denoise_net = self.dit
+        if self.config.ema.enabled and use_ema and self.dit_ema_bf16 is not None:
+            denoise_net = self.dit_ema_bf16
+        net_output_B_C_T_H_W, action_B_Horizon_Dof = denoise_net(
             x_B_C_T_H_W=net_state_in_B_C_T_H_W.to(**self.tensor_kwargs),
             timesteps_B_T=c_noise_B_1_T_1_1.squeeze(dim=[1, 3, 4]).to(**self.tensor_kwargs),
             action_B_T_D=a_net_state_in_B_T_D.to(**self.tensor_kwargs) if a_net_state_in_B_T_D is not None else None,
@@ -494,7 +507,12 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
 
         # Cut out the input and output frames
         ret_video = data_batch[self.input_video_key][:, :, :all_view_video_len]  # (B,3,V*(v_cond+v_out),256,256)
-        ret_action = data_batch[self.input_action_key][:, n_v_cond - 1: n_v_cond -1 + self.max_act_out]  # (B,a_out,2)
+        if data_batch[self.input_action_key].shape[1] == one_view_video_len:
+            ret_action = data_batch[self.input_action_key][:, n_v_cond - 1: n_v_cond -1 + self.max_act_out]  # cut to (B,a_out,2)
+        elif data_batch[self.input_action_key].shape[1] == self.max_act_out:
+            ret_action = data_batch[self.input_action_key]  # directly use (B,a_out,2)
+        else:
+            raise ValueError(f"action length {data_batch[self.input_action_key].shape[1]} is not supported")
         ret_agent_pos = data_batch[self.input_agent_pos_key][:, :n_v_cond]  # (B,v_cond,2)
 
         n_latent_v_cond = (n_v_cond - 1) // 4 + 1  # 4 is the default latent frame downsample ratio
@@ -665,6 +683,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         guidance: float = 1.5,
         is_negative_prompt: bool = False,
         use_cuda_graphs: bool = False,
+        use_ema: bool = False,
     ) -> Callable:
         """
         Called during inference to get the x0 prediction function.
@@ -676,6 +695,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         - data_batch (Dict): A batch of data used for conditioning. The format and content of this dictionary should align with the expectations of the `self.conditioner`
         - guidance (float, optional): A scalar value that modulates the influence of the conditioned state relative to the unconditioned state in the output. Defaults to 1.5.
         - is_negative_prompt (bool): use negative prompt t5 in uncondition if true
+        - use_ema (bool, optional): Whether to use EMA weights for the model during inference. Defaults to False.
 
         Returns:
         - Callable: A function `x0_fn(noise_x, sigma)` that takes two arguments, `noise_x` and `sigma`, and return x0 predictoin
@@ -748,6 +768,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             cond_x0_a0 = self.denoise(noise_x, sigma, condition, use_cuda_graphs=use_cuda_graphs,
                 at_B_T_D=noise_a,
                 a_sigma=sigma_a,
+                use_ema=use_ema,
                 )
             cond_x0 = cond_x0_a0.x0
             cond_a0 = cond_x0_a0.action0
@@ -755,6 +776,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             uncond_x0_a0 = self.denoise(noise_x, sigma, uncondition, use_cuda_graphs=use_cuda_graphs,
                 at_B_T_D=noise_a,
                 a_sigma=sigma_a,
+                use_ema=use_ema,
                 )
             uncond_x0 = uncond_x0_a0.x0
             uncond_a0 = uncond_x0_a0.action0
@@ -870,6 +892,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         solver_option: str = "2ab",
         n_views: int = 1,  # Multi-view related
         fps: int = 20,
+        use_ema: bool = False,  # Whether to use Online update EMA weights for inference
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Inference function for the Video2WorldExpertPipeline.
@@ -897,7 +920,7 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         assert num_conditional_frames % 4 == 1, "num_conditional_frames-1 must be divisible by 4"
         num_latent_conditional_frames = self.tokenizer.get_latent_num_frames(num_conditional_frames)
 
-        print("[DEBUG] pipeline.__call__ first_frame", first_frame.shape, "actions", actions.shape,)
+        # print("[DEBUG] pipeline.__call__ first_frame", first_frame.shape, "actions", actions.shape,)
 
         # num_video_frames = self.tokenizer.get_pixel_num_frames(self.config.state_t)
 
@@ -938,17 +961,21 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             fps=fps,
         )
         from debug.printer import print_batch
-        print_batch('[Video2WorldExpertPipeline] data_batch', data_batch)
+        # print_batch('[Video2WorldExpertPipeline] data_batch', data_batch)
         '''
         PushT:
-        [Video2WorldExpertPipeline] data_batch: Dict,keys=dict_keys(['dataset_name', 'video', 't5_text_embeddings', 'fps', 'padding_mask', 'num_conditional_frames', 'action'])
+        [Video2WorldExpertPipeline] data_batch: Dict,keys=dict_keys(['dataset_name', 'video', 't5_text_embeddings', 'fps', 'padding_mask', 'num_conditional_frames', 'num_conditional_actions', 'action', 'agent_pos', 'sample_n_views', 'latent_view_indices_B_T'])
         dataset_name:<class 'str'>,len=10
-        video,<class 'torch.Tensor'>,shape=torch.Size([1, 3, 13, 256, 256])
-        t5_text_embeddings,<class 'torch.Tensor'>,shape=torch.Size([1, 512, 1024])
-        fps,<class 'torch.Tensor'>,shape=torch.Size([1])
-        padding_mask,<class 'torch.Tensor'>,shape=torch.Size([1, 1, 256, 256])
-        num_conditional_frames:<class 'int'>,1
-        action,<class 'torch.Tensor'>,shape=torch.Size([1, 24, 2])
+        video,<class 'torch.Tensor'>,shape=torch.Size([25, 3, 25, 256, 256]),min=0.0000,max=255.0000
+        t5_text_embeddings,<class 'torch.Tensor'>,shape=torch.Size([25, 512, 1024]),min=0.0000,max=0.0000
+        fps,<class 'torch.Tensor'>,shape=torch.Size([25]),min=10.0000,max=10.0000
+        padding_mask,<class 'torch.Tensor'>,shape=torch.Size([25, 1, 256, 256]),min=0.0000,max=0.0000
+        num_conditional_frames:<class 'int'>,2
+        num_conditional_actions:<class 'int'>,0
+        action,<class 'torch.Tensor'>,shape=torch.Size([25, 20, 2]),min=0.0000,max=0.0000
+        agent_pos,<class 'torch.Tensor'>,shape=torch.Size([25, 5, 2]),min=-0.6172,max=0.4688
+        sample_n_views:<class 'int'>,1
+        latent_view_indices_B_T,<class 'torch.Tensor'>,shape=torch.Size([25, 7]),min=0.0000,max=0.0000
         LIBERO:
         [Video2WorldExpertPipeline] data_batch: Dict,keys=dict_keys(['dataset_name', 'video', 't5_text_embeddings', 'fps', 'padding_mask', 'num_conditional_frames', 'num_conditional_actions', 'action', 'agent_pos', 'sample_n_views', 'latent_view_indices_B_T'])
         dataset_name:<class 'str'>,len=10
@@ -987,7 +1014,12 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
         state_a_shape: [24, 2]
         '''
 
-        x0_fn = self.get_x0_fn_from_batch(data_batch, guidance, is_negative_prompt=True)  # will call self.denoise
+        x0_fn = self.get_x0_fn_from_batch(
+            data_batch,
+            guidance,
+            is_negative_prompt=True,
+            use_ema=use_ema,
+        )  # will call self.denoise
 
         log.info("Starting video generation...")
 
@@ -1074,10 +1106,10 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             samples_a = cat_outputs_cp(samples_a, seq_dim=1, cp_group=self.get_context_parallel_group())
 
         # Decode
-        video = self.decode(samples)  # shape: (B, C, T, H, W), possibly out of [-1, 1]
-        step_action = samples_a  # (B, Ta, Da), in [-1,1]
-        print("[DEBUG] pipeline.__call__ out video", video.shape, video.min(), video.max(),
-              "step_action", step_action.shape, step_action.min(), step_action.max(),)
+        video = self.decode(samples)  # shape: (B, C, v1+v2, H, W), possibly out of [-1, 1]
+        step_action = samples_a  # (B, v2, Da), in [-1,1]
+        # print("[DEBUG] pipeline.__call__ out video", video.shape, video.min(), video.max(),
+        #       "step_action", step_action.shape, step_action.min(), step_action.max(),)
 
         # Run video guardrail on the generated video and apply postprocessing
         if self.video_guardrail_runner is not None:
@@ -1105,4 +1137,79 @@ class Video2WorldExpertPipeline(Video2WorldPipeline):
             video = processed_video.to(video.device, dtype=video.dtype)
 
         log.success("Video generation completed successfully")
+
+        # (Optional) Prepare for online update data batch
+        if self.online_update_enabled:
+            clamped_video = video.clamp(-1.0, 1.0)
+            self._prepare_online_update_data_batch(
+                data_batch,
+                output_video=((clamped_video * 0.5 + 0.5) * 255.).to(torch.uint8),  # uint8 video in [0,255]
+                output_action=step_action
+            )
+
         return video, step_action
+
+    ### Online update related functions
+    def init_for_online_update(self, max_batches: int = 5):
+        """ Call before online update """
+        import copy
+        self.online_update_enabled = True
+        self.online_data_handler = OnlineDataHandler(
+            max_batches, device=self.device
+        )
+        self.dit.freeze_expert()
+        self.dit_ema_bf16 = copy.deepcopy(self.dit_ema).to(
+            device=self.device, dtype=torch.bfloat16)
+        self.dit_ema_bf16.eval()
+        log.info("[INFO] dit_ema_bf16 initialized")
+
+    def _prepare_online_update_data_batch(self, input_batch: Dict,
+                                         output_video: torch.Tensor,
+                                         output_action: torch.Tensor):
+        """ Call during inference to prepare data batch for online update """
+        if not self.online_update_enabled:
+            return
+        # Make a copy of the data batch to avoid in-place modification
+        copy_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in input_batch.items()}
+        # Replace the video with the generated video
+        assert copy_batch['video'].shape == output_video.shape, \
+            f"Shape mismatch: input video {copy_batch['video'].shape}, output video {output_video.shape}"
+        assert copy_batch['action'].shape == output_action.shape, \
+            f"Shape mismatch: input action {copy_batch['action'].shape}, output action {output_action.shape}"
+
+        copy_batch['video'] = output_video.detach().clone()
+        copy_batch['action'] = output_action.detach().clone()
+
+        copy_batch['is_preprocessed'] = False  # _normalize_video_databatch_inplace has changed the preprocessed flag
+
+        self.online_data_handler.add_batch(copy_batch)
+
+    @torch.no_grad()
+    def get_data_batch_for_online_update(self, gt_video: torch.Tensor):
+        """ Call during online update training to get data batch """
+        assert self.online_update_enabled, "Online update not enabled"
+        self.online_data_handler.update_latest_video(gt_video)
+        return self.online_data_handler.get_latest_batch()
+
+    @torch.no_grad()
+    def online_update_ema_bf16(self):
+        dit_ema_bf16 = self.dit_ema_bf16
+        dit_ema_fp32 = self.dit_ema
+        param_norm_before = self.calc_param_norm(self.dit_ema_bf16)
+        for (n_bf16, p_bf16), (n_fp32, p_fp32) in zip(dit_ema_bf16.named_parameters(), dit_ema_fp32.named_parameters()):
+            assert n_bf16 == n_fp32, f"Parameter name mismatch: {n_bf16} vs {n_fp32}"
+            p_bf16.data.copy_(p_fp32.data.to(torch.bfloat16))  # bf16 <:= fp32  原地拷贝
+        param_norm_after = self.calc_param_norm(self.dit_ema_bf16)
+        print("[DEBUG] online_update_ema_bf16 updated. "
+              f"Norm changed from: {param_norm_before:.4f} to {param_norm_after:.4f}")
+
+    @staticmethod
+    def calc_param_norm(model: torch.nn.Module) -> float:
+        total_norm = 0.0
+        for p in model.parameters():
+            param_norm = p.data.norm(2)
+            total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** (1. / 2)
+        return total_norm
+
+
