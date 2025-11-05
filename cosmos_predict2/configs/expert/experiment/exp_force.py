@@ -18,28 +18,31 @@ from hydra.core.config_store import ConfigStore
 cs = ConfigStore.instance()
 
 """
-torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train  \
+CUDA_VISIBLE_DEVICES=2,3,4,5 torchrun --nproc_per_node=4 --master_port=12341 -m scripts.train  \
     --config=cosmos_predict2/configs/base/config.py  \
-    -- experiment="cospred2_2b_expert_oxe"
+    -- experiment="cospred2_2b_force_tcl"
 """
-data_name = "fractal"
+data_name = "tcl"
 data_name_to_robot_states_dim = {
     "fractal": 8,  # 7 joint + 1 gripper
     "bridge": 7,   # 6 joint + 1 gripper
+    "tcl": 6,      # 6 tcp   + 2 blank
 }
 
-n_v_cond, n_v_out = 4 * 0 + 1, 4 * 3  # 4+1+20=25
+n_v_cond, n_v_out = 4 * 0 + 1, 4 * 8  # 0+1+32=33
+future_skip = 8
 n_a_out = n_v_out
-n_latent_v_cond, n_latent_v_out = 1 * 0 + 1, 1 * 3  # 1+1+5=7
-horizon = n_v_cond + n_v_out # 25
+n_v_skip_out = n_v_out // future_skip  # 32/8=4
+n_latent_v_cond, n_latent_v_out = ((n_v_cond - 1) // 4 + 1), n_v_skip_out // 4  # 1, 32/8/4=1
+horizon = n_v_cond + n_v_out  # without frame skip, 49
 pad_before = n_v_cond - 1
-cospred2_2b_expert_oxe = dict(
+cospred2_2b_force_tcl = dict(
     defaults=[
-        {"override /model": "predict2_v2w_2b_expert_fsdp"},  # modified
+        {"override /model": "predict2_v2w_2b_force_fsdp"},  # modified
         {"override /optimizer": "fusedadamw"},
         {"override /scheduler": "lambdalinear"},
         {"override /ckpt_type": "standard"},
-        {"override /dataloader_train": "oxe_train"},  # modified
+        {"override /dataloader_train": "tcl_train"},  # modified
         "_self_",
     ],
     model=dict(
@@ -49,14 +52,22 @@ cospred2_2b_expert_oxe = dict(
             pipe_config=dict(
                 ema=dict(enabled=True),  # ema is usually better
                 net=dict(
-                    action_dim=7*n_a_out,  # (act_dim * horizon)
-                    action_dof=7,  # oxe_uha: 3 xyz + 3 rot + 1 gripper
+                    # Action related
+                    action_dim=7*n_a_out,  # (act_dim * n_a_out)
+                    action_dof=7,  # tcl: 3 xyz + 3 rot + 1 gripper
                     ex_num_latent_frames=n_a_out,
-                    ex_dim=1024,
-                    ex_adaln_lora_dim=256,
+                    ex_dim=512,
+                    ex_adaln_lora_dim=128,
                     extra_robot_states_dim=data_name_to_robot_states_dim[data_name]*n_v_cond,  # (D*T), (joint + gripper) * max_obs, fractal:8, bridge:7
+                    # Force related
+                    force_raw_dim=6*(n_v_cond + n_v_skip_out),  # tcl: 3 force + 3 torque
+                    force_raw_dof=6,  # tcl: 3 force + 3 torque
+                    force_num_latent_frames=(n_v_cond + n_v_skip_out), # (B,T,1,W,D), T=num_latent_frames, can be different from video, latent and ori action are consistent, good?
+                    force_dim=512,  # expert feature dimension, D=dim
+                    force_adaln_lora_dim=128,
+                    # Multi-view related
                     state_t=n_latent_v_cond + n_latent_v_out,  # same as pipeline
-                    n_cameras_emb=1,  # ori:2
+                    n_cameras_emb=2,  # ori:2
                     concat_view_embedding=False,  # NVIDIA doesn't provide the 7-view ckpt
                 ),
                 state_t=n_latent_v_cond + n_latent_v_out,  # raw:8+1+24=33,
@@ -65,17 +76,21 @@ cospred2_2b_expert_oxe = dict(
                 p_all_actions_as_condition=0.3,  # ori:0.3
             ),
             model_manager_config=dict(
-                dit_path="checkpoints/cosmos_predict2/debug/cospred2_2b_expert_oxe_2025-10-23_23-19-08/checkpoints/model/iter_000092000.pt",
+                dit_path="checkpoints/cosmos_predict2/debug/cospred2_2b_force_tcl_2025-11-03_22-05-04/checkpoints/model/iter_000032000.pt",
             )
         )
     ),
-    job=dict(group="debug", name="cospred2_2b_expert_oxe_${now:%Y-%m-%d}_${now:%H-%M-%S}"),
+    job=dict(group="debug", name="cospred2_2b_force_tcl_${now:%Y-%m-%d}_${now:%H-%M-%S}"),
     model_parallel=dict(
         context_parallel_size=1,
     ),
+    dataloader_train=dict(
+        batch_size=24,  # now:20, ori:16
+        num_workers=8,
+    ),
     trainer=dict(
         distributed_parallelism="fsdp",
-        max_iter=100000,
+        max_iter=120_000,
         callbacks=dict(
             # iter_speed=dict(hit_thres=10),
             device_monitor=dict(every_n=2000),
@@ -83,14 +98,14 @@ cospred2_2b_expert_oxe = dict(
         )
     ),
     checkpoint=dict(
-        save_iter=4000,
+        save_iter=2000,
     ),
     optimizer=dict(
         lr=1e-4,  # or:1e-4,
     ),
     scheduler=dict(  # better
-        cycle_lengths=[80_000, 20_000],  # ori: [20_000, 20_000]
-        warm_up_steps=[2_000, 0],
+        cycle_lengths=[100_000, 20_000],  # ori: [20_000, 20_000]
+        warm_up_steps=[2_000, 0],  # ori: [2_000, 0]
         f_start=[0.01, 0.01],
         f_max=[1.0, 1.0],
         f_min=[1.0, 0.1],
@@ -102,7 +117,7 @@ cospred2_2b_expert_oxe = dict(
 for _item in [
     # predict2_video2world_2b
     # predict2_video2world_2b_action_conditioned_training,
-    cospred2_2b_expert_oxe,
+    cospred2_2b_force_tcl,
 ]:
     # Get the experiment name from the global variable, e.g. exp01_wan_lora -> experiment_name = "exp01_wan_lora"
     experiment_name = [name.lower() for name, value in globals().items() if value is _item][0]

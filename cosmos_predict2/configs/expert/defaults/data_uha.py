@@ -18,16 +18,16 @@ language_encoders_conf = dict(
 frame_transform_kwargs=dict(
     image_augment_kwargs=dict(
         primary=dict(
-            # random_resized_crop=dict(
-            #     scale=(0.8, 1.0),
-            #     ratio=(0.9, 1.1)
-            # ),
+            random_resized_crop=dict(
+                scale=(0.8, 1.0),
+                ratio=(0.9, 1.1)
+            ),
             random_brightness=(0.1,),
             random_contrast=(0.9, 1.1),
             random_saturation=(0.9, 1.1),
             random_hue=(0.05,),
             augment_order=(
-                # "random_resized_crop",
+                "random_resized_crop",
                 "random_brightness",
                 "random_contrast",
                 "random_saturation",
@@ -35,16 +35,16 @@ frame_transform_kwargs=dict(
             ),
         ),
         secondary=dict(
-            # random_resized_crop=dict(
-            #     scale=(0.8, 1.0),
-            #     ratio=(0.9, 1.1)
-            # ),
+            random_resized_crop=dict(
+                scale=(0.8, 1.0),
+                ratio=(0.9, 1.1)
+            ),
             random_brightness=(0.1,),
             random_contrast=(0.9, 1.1),
             random_saturation=(0.9, 1.1),
             random_hue=(0.05,),
             augment_order=(
-                # "random_resized_crop",
+                "random_resized_crop",
                 "random_brightness",
                 "random_contrast",
                 "random_saturation",
@@ -65,33 +65,33 @@ frame_transform_kwargs=dict(
         ),
     ),
     resize_size=dict(
-        primary=(128, 128),
+        primary=(144, 144),  # ori:176x176
         secondary=(128, 128),  # not used
         wrist=(128, 128),  # all black
     ),
     resize_size_future_obs=dict(
-        primary=(128, 128),
+        primary=(144, 144),
         secondary=(128, 128),  # should be same as resize_size
         wrist=(128, 128),
     ),
-    num_parallel_calls=24,
+    num_parallel_calls=32,
 )
 
 
-n_v_cond, n_v_out = 4 * 1 + 1, 4 * 5  # 4+1+20=25
+n_v_cond, n_v_out = 4 * 0 + 1, 4 * 3  # 4+1+20=25
 n_a_out = n_v_out
-n_latent_v_cond, n_latent_v_out = 1 * 1 + 1, 1 * 5  # 1+1+5=7
+n_latent_v_cond, n_latent_v_out = 1 * 0 + 1, 1 * 3  # 1+1+5=7
 horizon = n_v_cond + n_v_out # 25
 pad_before = n_v_cond - 1
 datasets_conf = dict(
-    DATA_NAME="fractal",  # ori: "fractal"
+    DATA_NAME="fractal",  # ori: "fractal", or "bridge"
     DATA_PATH="/home/geyuan/local_soft/huggingface/v1/",
     load_camera_views=["primary"],  # ori: ["primary", "secondary", "wrist"],
-    load_proprio=True,  # ori: False
+    load_proprio=False,  # ori: False
     load_language_embeddings=True,  # ori: False
     action_proprio_normalization_type="bounds",
     interleaved_dataset_cfg=dict(
-        shuffle_buffer_size=5000,  # ori: 5000
+        shuffle_buffer_size=10000,  # ori: 5000
         balance_weights=True,
         traj_transform_kwargs=dict(
             goal_relabeling_strategy=None,
@@ -106,8 +106,8 @@ datasets_conf = dict(
             load_future_frames=True, # NOTE: ori: False
         ),
         frame_transform_kwargs=frame_transform_kwargs,
-        traj_transform_threads=16,
-        traj_read_threads=8,
+        traj_transform_threads=20,
+        traj_read_threads=12,
     )
 )
 
@@ -115,7 +115,7 @@ uha_datamodule = L(OxeUhaDataModule)(
     transforms=transforms_conf,
     language_encoders=L(NoEncoder)(**language_encoders_conf),  # will be merged by OmegaConf
     datasets=datasets_conf,
-    batch_size=2,  # ori:20
+    batch_size=48,  # ori:48
     drop_last=True,
     # CosmosPredict2 specific
     use_ori_uha_data_collate=False,  # False: use modified collate fn in cosmos_predict2

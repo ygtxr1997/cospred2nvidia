@@ -19,6 +19,7 @@ import attrs
 
 from cosmos_predict2.configs.expert.defaults.data import register_training_and_val_data_expert
 from cosmos_predict2.configs.expert.defaults.model import register_model_expert
+from cosmos_predict2.configs.expert.defaults.model_force import register_model_force
 from cosmos_predict2.configs.action_conditioned.defaults.data import register_training_and_val_data_action_conditioned
 from cosmos_predict2.configs.action_conditioned.defaults.model import register_model_action_conditioned
 from cosmos_predict2.configs.base.defaults.callbacks import register_callbacks
@@ -94,6 +95,7 @@ def make_config() -> Config:
     # expert post-training config
     register_training_and_val_data_expert()
     register_model_expert()
+    register_model_force()
 
     # experiment config are defined in the experiment folder
     # call import_all_modules_from_package to register them

@@ -26,6 +26,7 @@ class TCLImageDataset(torch.utils.data.Dataset):
                  # Data format
                  shape_meta: dict,
                  norm_action_type: str = "minmax",
+                 norm_force_type: str = "quantile",  # NOTE: quantile uses `p01` and `p99` for normalization
                  # MDT related
                  batch_size: int = 64,
                  num_workers: int = 8,
@@ -73,8 +74,12 @@ class TCLImageDataset(torch.utils.data.Dataset):
             statistics_path = os.path.join(data_root, "statistics.json")
         self.data_meta = self.tcl_dataset.load_meta_from_json(statistics_path)
         self.norm_action_type = norm_action_type
+        self.norm_force_type = norm_force_type
         assert self.norm_action_type in ["minmax", "mean", "identity"], "norm type must be minmax, mean, or identity"
+        assert self.norm_force_type in ["minmax", "quantile", "identity"], "norm type must be minmax, quantile, or identity"
         self.all_rel_actions = self.tcl_dataset.extracted_data["rel_actions"]
+        self.all_robot_obs = self.tcl_dataset.dsets["robot_obs"]
+        self.all_force_torques = self.tcl_dataset.dsets["force_torque"]
         self.dataset_stats = self.data_meta["stats"]  # key: `rel_actions`, `robot_obs`, `force_torque`
         self.dataset_total_len = self.data_meta["total_len"]
 
@@ -404,8 +409,10 @@ class TCLImageDataset(torch.utils.data.Dataset):
                 else:
                     primary_rgb = sample_dict['gripper_rgb']  # (H,W,C)
                     gripper_rgb = sample_dict['primary_rgb']  # (H,W,C)
+                norm_state_type = "identity" if self.norm_action_type == "identity" else "mean"
+                assert norm_state_type in ["mean", "identity"], "state norm type must be mean or identity"
                 robot_obs = self.norm_state_or_force(
-                    sample_dict['robot_obs'], self.norm_action_type, self.dataset_stats["robot_obs"])
+                    sample_dict['robot_obs'], norm_state_type, self.dataset_stats["robot_obs"])
                 tcp_pose = joint_state = robot_obs[:6]  # (6,), NOTE: we use TCP Pose as the robot state
                 language = sample_dict['language_text']  # string
                 # Preprocess
@@ -419,7 +426,7 @@ class TCLImageDataset(torch.utils.data.Dataset):
                 if "force" in obs_keys:
                     force_torque = sample_dict['force_torque']  # (6,)
                     force_torque = self.norm_state_or_force(
-                        force_torque, self.norm_action_type, self.dataset_stats["force_torque"])
+                        force_torque, self.norm_force_type, self.dataset_stats["force_torque"])
                     force_torque = torch.from_numpy(force_torque).to(torch.float32)
             obs_data["image"].append(primary_rgb)
             obs_data["joint_state"].append(tcp_pose)
@@ -517,7 +524,7 @@ class TCLImageDataset(torch.utils.data.Dataset):
             gripper_data = action_data[..., -1:]  # (T, 1)
 
             # Normalize pose with mean/std
-            pose_normalized = (pose_data - dataset_mean[:-1]) / dataset_std[:-1]
+            pose_normalized = (pose_data - dataset_mean[:-1]) / dataset_std[:-1]  # to ~[-3,3]
 
             # Normalize gripper with minmax
             gripper_normalized = (gripper_data - dataset_min[-1:]) / (
@@ -534,6 +541,7 @@ class TCLImageDataset(torch.utils.data.Dataset):
     @staticmethod
     def denorm_action(action_data: np.ndarray, norm_type: str, meta_data: dict):
         if norm_type == "minmax":
+            action_data = np.clip(action_data, -1, 1)
             dataset_min = np.array(meta_data['min'])
             dataset_max = (meta_data['max'])
             action_data = (action_data + 1.) / 2.  # [-1,1] to [0,1]
@@ -544,13 +552,14 @@ class TCLImageDataset(torch.utils.data.Dataset):
             dataset_mean = np.array(meta_data['mean'])
             dataset_std = np.array(meta_data['std'])
             # Split into pose (first 6 dims) and gripper (last dim)
-            pose_data = action_data[..., :-1]  # (T, 6)
-            gripper_data = action_data[..., -1:]  # (T, 1)
+            pose_data = action_data[..., :-1]  # (T, 6), in ~[-3,3]
+            gripper_data = action_data[..., -1:]  # (T, 1), in [-1,1]
 
             # Denormalize pose with mean/std
-            pose_denormalized = pose_data * dataset_std[:-1] + dataset_mean[:-1]
+            pose_denormalized = pose_data * dataset_std[:-1] + dataset_mean[:-1]  # to original scale
 
             # Denormalize gripper with minmax
+            gripper_data = gripper_data.clip(-1, 1)
             gripper_denormalized = (gripper_data + 1.) / 2.  # to [0,1]
             gripper_denormalized = gripper_denormalized * (dataset_max[-1:] - dataset_min[-1:]) + dataset_min[-1:]
 
@@ -578,6 +587,12 @@ class TCLImageDataset(torch.utils.data.Dataset):
             dataset_mean = np.array(meta_data['mean'])[:D]
             dataset_std = np.array(meta_data['std'])[:D]
             out_data = (in_data - dataset_mean) / dataset_std
+        elif norm_type == "quantile":
+            dataset_p01 = np.array(meta_data['p01'])[:D]
+            dataset_p99 = np.array(meta_data['p99'])[:D]
+            in_data = np.clip(in_data, dataset_p01, dataset_p99)  # different from minmax
+            out_data = (in_data - dataset_p01) / (dataset_p99 - dataset_p01)  # norm here, in [0,1]
+            out_data = out_data * 2. - 1.  # in [-1,1]
         else:
             assert norm_type == "identity"
             out_data = in_data
@@ -595,6 +610,11 @@ class TCLImageDataset(torch.utils.data.Dataset):
             dataset_mean = np.array(meta_data['mean'][:D])
             dataset_std = np.array(meta_data['std'][:D])
             out_data = in_data * dataset_std + dataset_mean
+        elif norm_type == "quantile":
+            dataset_p01 = np.array(meta_data['p01'][:D])
+            dataset_p99 = np.array(meta_data['p99'][:D])
+            out_data = (in_data + 1.) / 2.  # [-1,1] to [0,1]
+            out_data = out_data * (dataset_p99 - dataset_p01) + dataset_p01  # to original scale
         else:
             assert norm_type == "identity"
             out_data = in_data
@@ -612,6 +632,7 @@ class TCLMergeDataset(torch.utils.data.Dataset):
                  # Data format
                  shape_meta: dict,
                  norm_action_type: str = "minmax",
+                 norm_force_type: str = "quantile",
                  # MDT related
                  batch_size: int = 64,
                  num_workers: int = 8,
@@ -644,6 +665,7 @@ class TCLMergeDataset(torch.utils.data.Dataset):
         self.val_ratio = val_ratio
         self.split = split
         self.norm_action_type = norm_action_type
+        self.norm_force_type = norm_force_type
         self.language_emb_model = language_emb_model
         self.camera_keys = camera_keys
         self.p_camera_drop = p_camera_drop
@@ -664,6 +686,7 @@ class TCLMergeDataset(torch.utils.data.Dataset):
                     pad_after=pad_after,
                     shape_meta=shape_meta,
                     norm_action_type="identity",  # NOTE: Use identity first, we'll handle norm later
+                    norm_force_type="identity",  # NOTE: Use identity first, we'll handle norm later
                     seed=seed,
                     val_ratio=val_ratio,
                     split=split,
@@ -700,6 +723,7 @@ class TCLMergeDataset(torch.utils.data.Dataset):
 
         # Validate norm_action_type
         assert self.norm_action_type in ["minmax", "mean", "identity"], "norm type must be minmax, mean, or identity"
+        assert self.norm_force_type in ["minmax", "quantile", "identity"], "norm type must be quantile, identity, or minmax"
 
         # For compatibility, create necessary attributes
         self.dataset_stats = self.merged_stats  # for compatibility
@@ -720,7 +744,9 @@ class TCLMergeDataset(torch.utils.data.Dataset):
 
         print(f"[TCLMergeDataset] datasets loaded from {len(data_roots)} roots, "
               f"split={self.split}, val_ratio={self.val_ratio}, len={len(self)}; "
-              f"meta_total_len={self.merged_total_len}, norm_type={self.norm_action_type}")
+              f"meta_total_len={self.merged_total_len}, "
+              f"norm_action_type={self.norm_action_type}, "
+              f"norm_force_type={self.norm_force_type}")
         beautiful_print(self.merged_stats)
 
     def _merge_metadata(self):
@@ -792,6 +818,27 @@ class TCLMergeDataset(torch.utils.data.Dataset):
                     'std': merged_std,
                 }
 
+            # Calculate p01 and p99 for force_torque if available
+            if 'force_torque' in self.merged_stats:
+                # To calculate merged quantiles accurately, we must use the raw data from all datasets.
+                all_forces_list = []
+                for dataset in self.datasets:
+                    # Access the raw force data from each sub-dataset
+                    if hasattr(dataset, 'all_force_torques') and dataset.all_force_torques is not None:
+                        all_forces_list.append(dataset.all_force_torques)
+
+                if all_forces_list:
+                    # Concatenate all force data into a single large numpy array
+                    merged_forces = np.concatenate(all_forces_list, axis=0)
+
+                    # Calculate p01 (1%) and p99 (99%) quantiles along the sample dimension (axis=0)
+                    p01 = np.quantile(merged_forces, q=0.01, axis=0)
+                    p99 = np.quantile(merged_forces, q=0.99, axis=0)
+
+                    # Add the calculated quantiles to the merged statistics dictionary
+                    self.merged_stats['force_torque']['p01'] = p01
+                    self.merged_stats['force_torque']['p99'] = p99
+
     def save_meta(self, save_path: str, force_path: bool = True):
         import copy, json
         dumpable_dict = copy.deepcopy(self.merged_stats)
@@ -822,6 +869,7 @@ class TCLMergeDataset(torch.utils.data.Dataset):
             pad_after=instance.pad_after,
             shape_meta=instance.shape_meta,
             norm_action_type=instance.norm_action_type,  # Use the same norm type for val_set
+            norm_force_type=instance.norm_force_type,  # Use the same norm type for val_set
             seed=instance.seed,
             val_ratio=instance.val_ratio,
             split='val',
@@ -853,10 +901,10 @@ class TCLMergeDataset(torch.utils.data.Dataset):
                     item_data["action"], self.norm_action_type, meta_data=self.merged_stats["rel_actions"]
                 )
                 item_data["agent_pos"] = TCLImageDataset.norm_state_or_force(
-                    item_data["agent_pos"], self.norm_action_type, meta_data=self.merged_stats["robot_obs"]
+                    item_data["agent_pos"], "mean", meta_data=self.merged_stats["robot_obs"]
                 )
                 item_data["force"] = TCLImageDataset.norm_state_or_force(
-                    item_data["force"], self.norm_action_type, meta_data=self.merged_stats["force_torque"]
+                    item_data["force"], self.norm_force_type, meta_data=self.merged_stats["force_torque"]
                 )
 
                 return item_data
@@ -868,6 +916,10 @@ class TCLMergeDataset(torch.utils.data.Dataset):
     @staticmethod
     def denorm_action(action_data: np.ndarray, norm_type: str, meta_data: dict):
         return TCLImageDataset.denorm_action(action_data, norm_type, meta_data)
+
+    @staticmethod
+    def norm_state_or_force(in_data: np.ndarray, norm_type: str, meta_data: dict):
+        return TCLImageDataset.norm_state_or_force(in_data, norm_type, meta_data)
 
     @staticmethod
     def denorm_state_or_force(in_data: np.ndarray, norm_type: str, meta_data: dict):

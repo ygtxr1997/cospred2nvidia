@@ -33,3 +33,14 @@ class DenoisePredictionWithAction:
     logvar: Optional[torch.Tensor] = None  # log variance of noise prediction,
     action0: torch.Tensor = None  # clean action prediction
     action_eps: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DenoisePredictionWithForce:
+    x0: torch.Tensor  # clean data prediction
+    eps: Optional[torch.Tensor] = None  # noise prediction
+    logvar: Optional[torch.Tensor] = None  # log variance of noise prediction,
+    action0: torch.Tensor = None  # clean action prediction
+    action_eps: Optional[torch.Tensor] = None
+    force0: torch.Tensor = None  # clean force prediction
+    force_eps: Optional[torch.Tensor] = None

@@ -10,17 +10,17 @@ import numpy as np
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
 from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
-from cosmos_predict2.configs.expert.defaults.data_tcl import tcl_train_dataset, DataLoader
+from cosmos_predict2.configs.expert.defaults.data_calvin import calvin_train_dataset, DataLoader
 from imaginaire.lazy_config import instantiate
 
 
 """
 Usage:
-conda activate cosmos-predit2
+conda activate cosmos-predict2
 cd ~/code/cospred2nvidia/
 export PYTHONPATH=~/code/cospred2nvidia/
-python scripts/get_t5_embeddings_from_tcl.py \
-    -d 1009_spoon_pick_place  # will be ignored
+CUDA_VISIBLE_DEVICES=3 python scripts/get_t5_embeddings_from_calvin.py \
+    -d 1009_spoon_pick_place  # not used, will be ignored
 """
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute T5 embeddings for text prompts")
@@ -95,19 +95,19 @@ def extract_lang_embeddings_with_t5(
         return save_to_dir
 
     # 1. Load dataset and dataloader
-    # tcl_train_dataset['data_root'] = os.path.join(ori_data_path, ori_data_name)  # dir containing `date/*.npz`
-    # tcl_train_dataset['h5_path'] = os.path.join(ori_data_path, "hdf5", f"{ori_data_name}{h5_suffix}.h5")  # h5 file path
-    tcl_train_dataset['camera_keys'] = ['image']  # to speed up
-    tcl_train_dataset['language_emb_model'] = ''  # we will compute them ourselves
+    calvin_train_dataset['action_seq_len'] = 4  # to speed up
+    calvin_train_dataset['obs_seq_len'] = 1  # to speed up
+    calvin_train_dataset['future_frame_skip'] = 1  # to speed up
+    calvin_train_dataset['language_emb_model'] = ''  # we will compute them ourselves
 
-    print(f"Extracting T5 embeddings from {tcl_train_dataset['data_roots']} to {save_to_dir} ...")
+    print(f"[Info] Extracting T5 embeddings from {calvin_train_dataset['datasets_dir']} to {save_to_dir} ...")
 
-    train_dataset = instantiate(tcl_train_dataset)
+    train_dataset = instantiate(calvin_train_dataset)
     train_dataloader = DataLoader(
         dataset=train_dataset,
         batch_size=128,
         shuffle=False,
-        num_workers=16,
+        num_workers=32,
         drop_last=False  # , coll
     )
 
@@ -243,7 +243,7 @@ if __name__ == "__main__":
         encoder = None
     else:
         # Initialize T5
-        print("[get_t5_embeddings_from_tcl] Initializing T5 model...")
+        print("[get_t5_embeddings_from_calvin] Initializing T5 model...")
         encoder = CosmosT5TextEncoder(
             cache_dir=args.cache_dir,
             local_files_only=True
@@ -257,16 +257,18 @@ if __name__ == "__main__":
 
     if not args.debug:
         extract_lang_embeddings_with_t5(
-            ori_data_path="/home/geyuan/local_soft/TCL/",
+            ori_data_path="/home/geyuan/local_soft/tmp/",
             ori_data_name=args.dataset_name,  # `1009_spoon_pick_place`,
             text_to_t5_embedding_func=text_to_t5_embedding_func,
             force_rebuild=True,
-            save_to_dir="/home/geyuan/local_soft/TCL/lang_emb_t5xxl/all/",
+            # save_to_dir="/home/geyuan/code/mdt24rss_fork/dataset/task_D_D/lang_emb_t5xxl/",
+            save_to_dir="/home/geyuan/code/mdt24rss_fork/dataset/task_ABC_D/lang_emb_t5xxl/",
         )
 
     # Load and verify
     saved_data = load_t5_embeddings(
-        save_dir=f"/home/geyuan/local_soft/TCL/lang_emb_t5xxl/all/"
+        # save_dir=f"/home/geyuan/code/mdt24rss_fork/dataset/task_D_D/lang_emb_t5xxl/"
+        save_dir=f"/home/geyuan/code/mdt24rss_fork/dataset/task_ABC_D/lang_emb_t5xxl/"
     )
     print("[DEBUG] loaded data keys:", saved_data.keys())
     print("[DEBUG] mapping:", len(saved_data['text_to_embedding_map'].items()),

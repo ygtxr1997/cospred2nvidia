@@ -23,11 +23,11 @@ from cosmos_predict2.data.action_conditioned.tcl_dataset import TCLImageDataset,
 from imaginaire.lazy_config import LazyCall as L
 
 
-n_v_cond, n_v_out = 4 * 0 + 1, 4 * 12  # 0+1+48=49
-future_skip = 6
+n_v_cond, n_v_out = 4 * 0 + 1, 4 * 8  # 0+1+32=33
+future_skip = 8
 n_a_out = n_v_out
 n_v_skip_out = n_v_out // future_skip  # 48/6=8
-n_latent_v_cond, n_latent_v_out = ((n_v_cond - 1) // 4 + 1), n_v_skip_out // 4  # 1, 48/6/4=2
+n_latent_v_cond, n_latent_v_out = ((n_v_cond - 1) // 4 + 1), n_v_skip_out // 4  # 1, 32/8/4=1
 horizon = n_v_cond + n_v_out  # without frame skip, 49
 pad_before = n_v_cond - 1
 tcl_train_dataset = L(TCLMergeDataset)(
@@ -52,7 +52,8 @@ tcl_train_dataset = L(TCLMergeDataset)(
             }
         }
     },
-    norm_action_type="mean",  # ori: "minmax", or "mean"
+    norm_action_type="minmax",  # ori: "minmax", or "mean"
+    norm_force_type="quantile",  # ori: "minmax"
     horizon=n_a_out,  # action length
     max_train_episodes=90,  # not used
     pad_before=pad_before,  # m_obs-1
@@ -97,7 +98,7 @@ def get_sampler(dataset):
         num_replicas=parallel_state.get_data_parallel_world_size(),
         rank=parallel_state.get_data_parallel_rank(),
         shuffle=True,
-        seed=3,  # ori:0
+        seed=4,  # ori:0
     )
 
 

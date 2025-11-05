@@ -79,11 +79,16 @@ class IterSpeed(EveryN):
 
         if output_batch.get("action_edm_loss") is None:
             log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}")
-        else:
+        elif output_batch.get("force_edm_loss") is None:
             log.info(f"{iteration} : iter_speed {iter_speed:.2f} seconds per iteration | Loss: {loss.item():.4f}"
                      f" | Action EDM Loss: {output_batch['action_edm_loss'].item():.4f}"
                      f" | Action MSE Loss: {output_batch['action_mse_loss'].item():.4f}"
                      f" | Video EDM Loss: {output_batch['edm_loss'].item():.4f}"
+                     f" | Video MSE Loss: {output_batch['mse_loss'].item():.4f}")
+        else:
+            log.info(f"{iteration} : iter_speed {iter_speed:.2f} s/it | Loss: {loss.item():.4f}"
+                     f" | Action MSE Loss: {output_batch['action_mse_loss'].item():.4f}"
+                     f" | Force MSE Loss: {output_batch['force_mse_loss'].item():.4f}"
                      f" | Video MSE Loss: {output_batch['mse_loss'].item():.4f}")
 
         self.time = cur_time

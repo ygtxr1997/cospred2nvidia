@@ -303,7 +303,7 @@ class DdpTfBroadcastDataset(IterableDataset):
         self._meta_spec = None
 
         for i in range(num_iterations):
-            if i % 100 == 0 or i < 3:
+            if i % 1000 == 0 or i < 3:
                 print(f"[DEBUG] Rank {rank} - Iteration {i}/{num_iterations}")
 
             # ---------- Rank 0：取 super_batch ----------
@@ -577,9 +577,9 @@ class OxeUhaDataModule(object):
             "t5_text_embeddings": ret_text_embeddings,
             "t5_text_mask": torch.ones(512, dtype=torch.int64),
             "fps": torch.ones(B) * 10,
-            "image_size": torch.tensor([176, 176, 176, 176]),
+            "image_size": torch.tensor([144, 144, 144, 144]),
             "num_frames": self.horizon,
-            "padding_mask": torch.zeros(B, 1, 176, 176, dtype=torch.bool),
+            "padding_mask": torch.zeros(B, 1, 144, 144, dtype=torch.bool),
             "sample_n_views": ret_n_views,
             "view_indices": view_indices_t,
             "latent_view_indices_B_T": latent_view_indices_t,

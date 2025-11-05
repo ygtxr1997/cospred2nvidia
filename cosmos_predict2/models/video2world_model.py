@@ -309,6 +309,7 @@ class Predict2Video2WorldModel(ImaginaireModel):
         for name, param in model.named_parameters():
             total_params += param.numel()
             if param.requires_grad:
+                print("[DEBUG] lora", name)
                 lora_params += param.numel()
                 # Upcast LoRA parameters into fp32
                 param.data = param.to(torch.float32)

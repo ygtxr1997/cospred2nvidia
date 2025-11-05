@@ -2,20 +2,30 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
+from robokit.debug_utils.images import plot_action_wrt_time, save_frames_as_video
 from imaginaire.utils import distributed, log, misc
 
 
-def save_action_as_image(action_T_D: np.ndarray, save_path):
+def save_action_as_image(action_T_D: np.ndarray, save_path: str,
+                         is_rel: bool = False, fps=15):
     """
     Save action sequence as trajectory image.
     action_T_D: (T,D) numpy array, expected shape (T,2) or (T,3) with values in [-1,1]
     """
+    assert type(action_T_D) == np.ndarray, f"Expected numpy array, got {type(action_T_D)}"
     if action_T_D.shape[1] == 1:
         save_1d_action_as_image(action_T_D, save_path)
     elif action_T_D.shape[1] == 2:
         save_2d_action_as_image(action_T_D, save_path)
     elif action_T_D.shape[1] == 3:
-        save_3d_action_as_image(action_T_D, save_path)
+        if not is_rel:
+            save_3d_action_as_image(action_T_D, save_path)
+        else:
+            frames, _, _ = plot_action_wrt_time(action_T_D)
+            save_frames_as_video(frames, save_path, fps=fps)
+    elif action_T_D.shape[1] >= 6:
+        frames, _, _ = plot_action_wrt_time(action_T_D)
+        save_frames_as_video(frames, save_path, fps=fps)
     else:
         raise ValueError(f"Unsupported action dimension: {action_T_D.shape[1]}")
 
@@ -162,6 +172,8 @@ def save_3d_action_as_image(action_T_D: np.ndarray, save_path):
     xyz_min, xyz_max = -0.2, 1.2
     xyz_min = min(trajectory.min(), xyz_min)  # in case actio out of our expected range: [-0.2,1.2]
     xyz_max = max(trajectory.max(), xyz_max)
+    if trajectory.min() > -0.16 and trajectory.max() < 0.16:
+        xyz_min, xyz_max = -0.16, 0.16  # zoom in for small range
     ax.set_xlim(xyz_min, xyz_max)
     ax.set_ylim(xyz_min, xyz_max)
     ax.set_zlim(xyz_min, xyz_max)

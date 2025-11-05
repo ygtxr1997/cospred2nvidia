@@ -2,14 +2,80 @@ from collections import deque
 from typing import Dict, Any, List, Optional
 import torch
 import numpy as np
+import torch.nn.functional as F
+from torchvision import transforms
 
-from cosmos_predict2.connects.utils import replace_multiview_video_back_with_another
+from cosmos_predict2.connects.utils import (
+    replace_multiview_video_back_with_another,
+    get_skipped_indices,
+    get_frames_from_multiview_video,
+)
 
 from imaginaire.utils import log
 
 
+class VideoAugmentation:
+    def __init__(self, enable_augmentation: bool = True):
+        self.enable_augmentation = enable_augmentation
+        self.augmentation_prob = 0.7
+        self.color_jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+        self.gaussian_blur = transforms.GaussianBlur(kernel_size=(7, 7), sigma=(0.1, 2.0))
+
+    def augment_video(self, video_B_C_T_H_W: torch.Tensor) -> torch.Tensor:
+        """
+        对整个视频进行增广。保证每一帧用相同的增广方式。
+
+        Args:
+            video_B_C_T_H_W: 输入视频 tensor，形状为 (B, C, T, H, W)，类型为 uint8
+
+        Returns:
+            augmented_video: 增广后的视频 tensor，形状与输入相同，类型为 uint8
+        """
+        assert video_B_C_T_H_W.dtype == torch.uint8, f"Input video must be of type uint8, got {video_B_C_T_H_W.dtype}"
+
+        if not self.enable_augmentation:
+            return video_B_C_T_H_W
+        if np.random.rand() > self.augmentation_prob:
+            return video_B_C_T_H_W
+
+        # 转换为 float32 [0,1] 范围进行增广
+        video_float = video_B_C_T_H_W.float() / 255.0
+        video = video_float.permute(0, 2, 1, 3, 4)  # (B, T, C, H, W)
+
+        B, T, C, H, W = video.shape
+        augmented_video = []
+
+        for b in range(B):
+            # 为每个视频样本固定随机种子
+            seed = np.random.randint(0, 2 ** 31)
+
+            augmented_frames = []
+            for t in range(T):
+                frame = video[b, t]  # (C, H, W)
+
+                # 设置随机种子保证每帧应用相同的随机增广
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+
+                frame = self.color_jitter(frame)
+                frame = self.gaussian_blur(frame)
+
+                augmented_frames.append(frame)
+
+            augmented_video.append(torch.stack(augmented_frames, dim=0))
+
+        augmented_video = torch.stack(augmented_video, dim=0)
+        augmented_video = augmented_video.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+
+        # 转换回 uint8
+        augmented_video = torch.clamp(augmented_video * 255.0, 0, 255).byte()
+
+        return augmented_video
+
+
 class OnlineDataHandler:
-    def __init__(self, max_batches: int = 100, device: str = "cuda"):
+    def __init__(self, max_batches: int = 100, device: str = "cuda",
+                 future_skip_frames: int = 1,):
         """
         Online data handler for storing and concatenating batches used in Video2WorldExpertPipeline.
 
@@ -19,8 +85,11 @@ class OnlineDataHandler:
         """
         self.device = device
         self.max_batches = max_batches
+        self.future_skip_frames = future_skip_frames
         self.batch_queue = deque(maxlen=max_batches)
-        log.info(f"Initialized OnlineDataHandler with max_batches={max_batches}, device={device}")
+        self.video_augmentor = VideoAugmentation(enable_augmentation=True)
+        log.info(f"Initialized OnlineDataHandler with "
+                 f"max_batches={max_batches}, device={device}, future_skip_frames={future_skip_frames}")
 
     def add_batch(self, batch: Dict[str, Any]) -> None:
         """
@@ -107,16 +176,34 @@ class OnlineDataHandler:
         if not self.batch_queue:
             raise ValueError("No batches in queue")
         device, dtype = self.get_latest_batch()["video"].device, self.get_latest_batch()["video"].dtype
-        gt_video = gt_video.to(device=device, dtype=dtype)  # (B,C,V*Ts,H,W)
+        gt_video = gt_video.to(device=device, dtype=dtype)  # (B,C,V*Ts,H,W), uint8
 
         sample_n_views = self.get_latest_batch()["sample_n_views"]
         action_horizon = self.get_latest_batch()["action"].shape[1]  # (B,v2,D)
 
-        self.batch_queue[-1]["video"] = replace_multiview_video_back_with_another(
-            self.batch_queue[-1]["video"],  # (B,C,V*(v1+v2),H,W)
+        _, _, VTs, _, _ = gt_video.shape
+        _, _, Vv12, _, _ = self.get_latest_batch()["video"].shape
+        Ts = VTs // sample_n_views  # feedback frames in gt_video single view, without obs frames
+        v12 = Vv12 // sample_n_views  # v1+v2 in a single view
+        v2 = action_horizon // self.future_skip_frames  # v2 = skipped future prediction
+        v1 = v12 - v2
+        assert Ts == v2 * self.future_skip_frames
+        gt_skipped_indices = np.arange(self.future_skip_frames - 1, Ts)[0::self.future_skip_frames]  # no obs frames
+        assert gt_skipped_indices[-1] == Ts - 1, \
+            f"Last skipped index {gt_skipped_indices[-1]} does not match Ts-1 {Ts - 1}"
+        gt_skipped_video = get_frames_from_multiview_video(
             gt_video,
             sample_n_views=sample_n_views,
-            replace_length=action_horizon,
+            skipped_indices=gt_skipped_indices,
+        )  # (B,V*(v2),H,W,C)
+
+        # NOTE: force data also needs to be handled
+
+        self.batch_queue[-1]["video"] = replace_multiview_video_back_with_another(
+            self.batch_queue[-1]["video"],  # (B,C,V*(v1+v2),H,W)
+            gt_skipped_video,
+            sample_n_views=sample_n_views,
+            replace_length=v2,
         )
         log.info(f"Updated latest batch video with new ground truth video.")
 
@@ -124,7 +211,26 @@ class OnlineDataHandler:
         """Get the most recently added batch."""
         if not self.batch_queue:
             raise ValueError("No batches in queue")
-        return self.batch_queue[-1]
+
+        # 深拷贝最新批次
+        latest_batch = {}
+        for key, value in self.batch_queue[-1].items():
+            if isinstance(value, torch.Tensor):
+                latest_batch[key] = value.clone()
+            elif isinstance(value, np.ndarray):
+                latest_batch[key] = value.copy()
+            elif isinstance(value, list):
+                latest_batch[key] = value.copy()
+            elif isinstance(value, dict):
+                latest_batch[key] = value.copy()
+            else:
+                # 对于基本类型（int, float, str），直接赋值即可
+                latest_batch[key] = value
+
+        latest_batch["video"] = self.video_augmentor.augment_video(
+            latest_batch["video"])  # (B,C,V*Ts,H,W), uint8
+
+        return latest_batch
 
     def get_oldest_batch(self) -> Dict[str, Any]:
         """Get the oldest batch in the queue."""

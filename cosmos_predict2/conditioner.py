@@ -700,6 +700,210 @@ class ActionCondition(VideoCondition):
         return type(self)(**kwargs)
 
 
+@dataclass(frozen=True)
+class ForceCondition(VideoCondition):
+    # Action related
+    gt_actions: Optional[torch.Tensor] = None  # denoising target output
+    condition_action_input_mask_B_T_D: Optional[torch.Tensor] = None  # binary mask, 1: condition, 0: predict
+    agent_pos: Optional[torch.Tensor] = None  # e.g joint_states 7 + gripper_state 1
+    # Force related
+    gt_forces: Optional[torch.Tensor] = None  # denoising target output
+    condition_force_input_mask_B_T_D: Optional[torch.Tensor] = None  # binary, 1: condition, 0: predict
+    # Multi-view related
+    state_t: Optional[int] = None
+    view_indices_B_T: Optional[torch.Tensor] = None
+
+    def set_video_condition(
+            self,
+            gt_frames: torch.Tensor,  # latent state, (B,D,V*(v1+v2)',32,32), `'` means latent num frames
+            random_min_num_conditional_frames: int,
+            random_max_num_conditional_frames: int,
+            num_conditional_frames: Optional[Union[torch.Tensor, int]] = None,  # (B) num in latent space for a view
+            # Action related
+            gt_actions: Optional[torch.Tensor] = None,  # raw action, (B,v2,Da)
+            num_conditional_actions: Optional[Union[torch.Tensor, int]] = None,  # (B) different across in a train batch
+            agent_pos: Optional[torch.Tensor] = None,  # robot states, (B,v2,Dp)
+            # Force related
+            gt_forces: Optional[torch.Tensor] = None,  # raw force, (B,v1+v2,Df)
+            # Multi-view related
+            state_t: int = None,  # should be provided
+            condition_locations: Union[ConditionLocationList, ListConfig] = [ConditionLocation.FIRST_RANDOM_N],
+    ) -> ForceCondition:
+        assert gt_actions is not None, "gt_actions should be provided for ForceCondition"
+        assert gt_forces is not None, "gt_forces should be provided for ForceCondition"
+        kwargs = self.to_dict(skip_underscore=False)
+        kwargs["gt_frames"] = gt_frames
+        kwargs["gt_actions"] = gt_actions
+        kwargs["gt_forces"] = gt_forces
+        kwargs["agent_pos"] = agent_pos
+        kwargs["state_t"] = state_t
+
+        B, _, T, H, W = gt_frames.shape
+        condition_video_input_mask_B_C_T_H_W = torch.zeros(
+            B, 1, T, H, W, dtype=gt_frames.dtype, device=gt_frames.device
+        )
+        B, Ta, _ = gt_actions.shape
+        condition_action_input_mask_B_T_D = torch.zeros(
+            B, Ta, 1, dtype=gt_actions.dtype, device=gt_actions.device
+        )
+        B, Tf, _ = gt_forces.shape
+        condition_force_input_mask_B_T_D = torch.zeros(
+            B, Tf, 1, dtype=gt_forces.dtype, device=gt_forces.device
+        )
+
+        assert agent_pos is not None, "agent_pos should be provided for ForceCondition"
+        assert len(condition_locations) > 0, "condition_locations must be provided."
+        assert state_t is not None, "state_t must be provided."
+        assert T > 1, "Image batches are not supported."
+        assert T % state_t == 0, f"T must be a multiple of state_t. Got T={T} and state_t={state_t}."
+        sample_n_views = T // state_t
+        condition_video_input_mask_B_C_V_T_H_W = torch.zeros(
+            B, 1, sample_n_views, state_t, H, W, dtype=gt_frames.dtype, device=gt_frames.device
+        )
+
+        # Handle type of num_conditional_frames and num_conditional_actions
+        # NOTE: for forces, despite sharing the same conditional number with videos,
+        # num_conditional_frames need to be converted into raw space
+        def latent_to_raw(num_latent_frames: Union[int, torch.Tensor]) -> Union[int, torch.Tensor]:
+            return (num_latent_frames - 1) * 4 + 1
+        num_conditional_forces = None
+        if isinstance(num_conditional_frames, int):
+            num_conditional_forces = torch.ones(B, dtype=torch.int32) * latent_to_raw(num_conditional_frames)
+            num_conditional_frames = torch.ones(B, dtype=torch.int32) * num_conditional_frames
+        elif isinstance(num_conditional_frames, torch.Tensor):
+            num_conditional_forces = latent_to_raw(num_conditional_frames)
+            num_conditional_frames = num_conditional_frames.to(torch.int32)
+        if isinstance(num_conditional_actions, int):
+            num_conditional_actions = torch.ones(B, dtype=torch.int32) * num_conditional_actions
+        elif isinstance(num_conditional_actions, torch.Tensor):
+            num_conditional_actions = num_conditional_actions.to(torch.int32)
+
+        # Handle video batch
+        if num_conditional_frames is not None:
+            num_conditional_frames_B = num_conditional_frames  # already in latent space
+        else:
+            raise NotImplementedError("random num_conditional_frames not implemented yet for ForceCondition")
+            num_conditional_frames_B = torch.randint(
+                random_min_num_conditional_frames, random_max_num_conditional_frames + 1, size=(B,)
+            )  # this should not be used in Expert series models
+        T_raw = sample_n_views * ((state_t - 1) * 4 + 1)  # e.g. T=4 -> T_raw=13;
+        num_conditional_actions_B = num_conditional_actions  # in raw space
+        num_conditional_forces_B = num_conditional_forces  # in raw space
+
+        for idx in range(B):
+            condition_video_input_mask_B_C_V_T_H_W[
+                idx, :, :, : num_conditional_frames_B[idx], :, :] += 1
+            condition_action_input_mask_B_T_D[
+                idx, : num_conditional_actions_B[idx], :] += 1
+            condition_force_input_mask_B_T_D[
+                idx, : num_conditional_forces_B[idx], :] += 1
+
+        condition_video_input_mask_B_C_T_H_W = rearrange(condition_video_input_mask_B_C_V_T_H_W,
+            "B C V T H W -> B C (V T) H W", V=sample_n_views)
+
+        kwargs["condition_video_input_mask_B_C_T_H_W"] = condition_video_input_mask_B_C_T_H_W
+        kwargs["condition_action_input_mask_B_T_D"] = condition_action_input_mask_B_T_D
+        kwargs["condition_force_input_mask_B_T_D"] = condition_force_input_mask_B_T_D
+        return type(self)(**kwargs)
+
+    def edit_for_inference(self, is_cfg_conditional: bool = True,
+                           num_conditional_frames: int = 1,
+                           num_conditional_actions: int = 12,
+                           ) -> VideoCondition:
+        _condition = self.set_video_condition(
+            gt_frames=self.gt_frames,
+            random_min_num_conditional_frames=0,
+            random_max_num_conditional_frames=0,
+            num_conditional_frames=num_conditional_frames,
+            gt_actions=self.gt_actions,
+            num_conditional_actions=num_conditional_actions,
+            agent_pos=self.agent_pos,
+            gt_forces=self.gt_forces,
+            state_t=self.state_t,
+            # condition_locations=[ConditionLocation.FIRST_RANDOM_N],  # not used here
+        )
+        if not is_cfg_conditional:
+            # Do not use classifier free guidance on conditional frames.
+            # YB found that it leads to worse results.
+            _condition.use_video_condition.fill_(True)
+        return _condition
+
+    def broadcast(self, process_group: torch.distributed.ProcessGroup) -> ForceCondition:
+        if self.is_broadcasted:
+            return self
+        # extra efforts
+        gt_frames = self.gt_frames
+        gt_actions = self.gt_actions
+        gt_forces = self.gt_forces
+        agent_pos = self.agent_pos
+        view_indices_B_T = self.view_indices_B_T
+        condition_video_input_mask_B_C_T_H_W = self.condition_video_input_mask_B_C_T_H_W
+        condition_action_input_mask_B_T_D = self.condition_action_input_mask_B_T_D
+        condition_force_input_mask_B_T_D = self.condition_force_input_mask_B_T_D
+        kwargs = self.to_dict(skip_underscore=False)
+        kwargs["gt_frames"] = None
+        kwargs["gt_actions"] = None
+        kwargs["agent_pos"] = None
+        kwargs["condition_video_input_mask_B_C_T_H_W"] = None
+        kwargs["condition_action_input_mask_B_T_D"] = None
+        kwargs["condition_force_input_mask_B_T_D"] = None
+        kwargs["view_indices_B_T"] = None
+        new_condition = TextCondition.broadcast(
+            type(self)(**kwargs),
+            process_group,
+        )
+
+        kwargs = new_condition.to_dict(skip_underscore=False)
+        _, _, T, _, _ = gt_frames.shape
+        n_views = T // self.state_t
+        assert T % self.state_t == 0, f"T must be a multiple of state_t. Got T={T} and state_t={self.state_t}."
+        if process_group is not None:
+            if T > 1 and process_group.size() > 1:  # when will go here?
+                gt_frames_B_C_V_T_H_W = rearrange(gt_frames, "B C (V T) H W -> B C V T H W", V=n_views)
+                condition_video_input_mask_B_C_V_T_H_W = rearrange(
+                    condition_video_input_mask_B_C_T_H_W, "B C (V T) H W -> B C V T H W", V=n_views
+                )
+                view_indices_B_V_T = rearrange(view_indices_B_T, "B (V T) -> B V T", V=n_views)
+
+                gt_frames_B_C_V_T_H_W = broadcast_split_tensor(
+                    gt_frames_B_C_V_T_H_W, seq_dim=3, process_group=process_group)
+                condition_video_input_mask_B_C_V_T_H_W = broadcast_split_tensor(
+                    condition_video_input_mask_B_C_V_T_H_W, seq_dim=3, process_group=process_group)
+                view_indices_B_V_T = broadcast_split_tensor(
+                    view_indices_B_V_T, seq_dim=2, process_group=process_group)
+
+                gt_frames_B_C_T_H_W = rearrange(gt_frames_B_C_V_T_H_W, "B C V T H W -> B C (V T) H W", V=n_views)
+                condition_video_input_mask_B_C_T_H_W = rearrange(
+                    condition_video_input_mask_B_C_V_T_H_W, "B C V T H W -> B C (V T) H W", V=n_views
+                )
+                view_indices_B_T = rearrange(view_indices_B_V_T, "B V T -> B (V T)", V=n_views)
+
+                # gt_frames = broadcast_split_tensor(gt_frames, seq_dim=2, process_group=process_group)
+                # condition_video_input_mask_B_C_T_H_W = broadcast_split_tensor(
+                #     condition_video_input_mask_B_C_T_H_W, seq_dim=2, process_group=process_group
+                # )
+
+                gt_actions = broadcast_split_tensor(gt_actions, seq_dim=1, process_group=process_group)
+                condition_action_input_mask_B_T_D = broadcast_split_tensor(
+                    condition_action_input_mask_B_T_D, seq_dim=1, process_group=process_group
+                )
+                agent_pos = broadcast_split_tensor(agent_pos, seq_dim=1, process_group=process_group)
+
+                gt_forces = broadcast_split_tensor(gt_forces, seq_dim=1, process_group=process_group)
+                condition_force_input_mask_B_T_D = broadcast_split_tensor(
+                    condition_force_input_mask_B_T_D, seq_dim=1, process_group=process_group
+                )
+
+        kwargs["gt_frames"] = gt_frames_B_C_T_H_W
+        kwargs["gt_actions"] = gt_actions
+        kwargs["agent_pos"] = agent_pos
+        kwargs["condition_video_input_mask_B_C_T_H_W"] = condition_video_input_mask_B_C_T_H_W
+        kwargs["condition_action_input_mask_B_T_D"] = condition_action_input_mask_B_T_D
+        kwargs["condition_force_input_mask_B_T_D"] = condition_force_input_mask_B_T_D
+        kwargs["view_indices_B_T"] = view_indices_B_T
+        return type(self)(**kwargs)
+
+
 # ------------------- conditioner classes -------------------
 
 
@@ -905,6 +1109,21 @@ class ActionConditioner(VideoConditioner):
         output["gt_actions"] = batch["action"]
         del output["action"]  # remove action from output, as it is not part of ActionCondition
         return ActionCondition(**output)
+
+class ForceConditioner(VideoConditioner):
+    def forward(
+        self,
+        batch: Dict,
+        override_dropout_rate: Optional[Dict[str, float]] = None,
+    ) -> ForceCondition:
+        output = super()._forward(batch, override_dropout_rate)
+        assert "action" in batch, "ForceConditioner requires 'action' in batch"
+        assert "force" in batch, "ForceConditioner requires 'force' in batch"
+        output["gt_actions"] = batch["action"]
+        output["gt_forces"] = batch["force"]  # NOTE: hard code for dataloader keys
+        del output["action"]  # remove action from output, as it is not part of ForceCondition
+        del output["force"]  # remove force from output, as it is not part of ForceCondition
+        return ForceCondition(**output)
 
 
 class ConditionLocationListValidator(Validator):

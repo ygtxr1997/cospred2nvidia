@@ -129,13 +129,16 @@ def print_environ_variables(env_vars: list[str]) -> None:
             log.warning(f"Environment variable {Color.green(env_var)} not set!")
 
 
-def set_random_seed(seed: int, by_rank: bool = False) -> None:
+def set_random_seed(seed: int | None, by_rank: bool = False) -> None:
     """Set random seed. This includes random, numpy, Pytorch.
 
     Args:
         seed (int): Random seed.
         by_rank (bool): if true, each GPU will use a different random seed.
     """
+    if seed is None:
+        seed = int(time.time() * 1000) % (2**32)  # 使用毫秒时间戳
+
     if by_rank:
         seed += distributed.get_rank()
     log.info(f"Using random seed {seed}.")

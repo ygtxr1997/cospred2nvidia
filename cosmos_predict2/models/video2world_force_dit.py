@@ -52,25 +52,39 @@ class AttentionWExpert(Attention):
             ex_n_heads: int = 8,
             ex_head_dim: int = 64,
             ex_dropout: float = 0.0,
+            # Force-specific parameters
+            force_query_dim: int = 512,
+            force_n_heads: int = 8,
+            force_head_dim: int = 64,
+            force_dropout: float = 0.0,
             # Multi-view related parameters
             n_cameras: int = 1,
-            # Attention-Entropy parameters
-            use_attention_entropy: bool = False,
     ) -> None:
         super(AttentionWExpert, self).__init__(query_dim, context_dim, n_heads, head_dim, dropout,
                                                qkv_format, backend, natten_params)
         self.ex_dropout = ex_dropout
+        self.force_dropout = force_dropout
 
         is_self_attn = context_dim is None
         if is_self_attn:  # `ex_inner_dim` == `inner_dim`
             self.ex_n_heads = n_heads
             self.ex_head_dim = head_dim
             ex_context_dim = ex_query_dim
+
+            self.force_n_heads = n_heads
+            self.force_head_dim = head_dim
+            force_context_dim = force_query_dim
         else:
             self.ex_n_heads = ex_n_heads
             self.ex_head_dim = ex_head_dim
             ex_context_dim = context_dim
+
+            self.force_n_heads = force_n_heads
+            self.force_head_dim = force_head_dim
+            force_context_dim = context_dim
+
         ex_inner_dim = self.ex_head_dim * self.ex_n_heads
+        force_inner_dim = self.force_head_dim * self.force_n_heads
 
         self.ex_q_proj = nn.Linear(ex_query_dim, ex_inner_dim, bias=False)
         self.ex_q_norm = te.pytorch.RMSNorm(self.ex_head_dim, eps=1e-6)
@@ -81,18 +95,28 @@ class AttentionWExpert(Attention):
         self.ex_v_proj = nn.Linear(ex_context_dim, ex_inner_dim, bias=False)
         self.ex_v_norm = nn.Identity()
 
+        self.force_q_proj = nn.Linear(force_query_dim, force_inner_dim, bias=False)
+        self.force_q_norm = te.pytorch.RMSNorm(self.force_head_dim, eps=1e-6)
+        self.force_k_proj = nn.Linear(force_context_dim, force_inner_dim, bias=False)
+        self.force_k_norm = te.pytorch.RMSNorm(self.force_head_dim, eps=1e-6)
+        self.force_v_proj = nn.Linear(force_context_dim, force_inner_dim, bias=False)
+        self.force_v_norm = nn.Identity()
+
         self.ex_out_proj = nn.Linear(ex_inner_dim, ex_query_dim, bias=False)
         self.ex_output_dropout = nn.Dropout(ex_dropout) if ex_dropout > 1e-4 else nn.Identity()
+
+        self.force_out_proj = nn.Linear(force_inner_dim, force_query_dim, bias=False)
+        self.force_output_dropout = nn.Dropout(force_dropout) if force_dropout > 1e-4 else nn.Identity()
 
         self._ex_query_dim = ex_query_dim
         self._ex_context_dim = ex_context_dim
         self._ex_inner_dim = ex_inner_dim
 
-        self._n_cameras = n_cameras
+        self._force_query_dim = force_query_dim
+        self._force_context_dim = force_context_dim
+        self._force_inner_dim = force_inner_dim
 
-        # Attention-Entropy
-        self.use_attention_entropy = use_attention_entropy
-        self.attention_entropy_loss = None  # will be set during training if needed
+        self._n_cameras = n_cameras
 
         self.init_weights()
 
@@ -115,6 +139,21 @@ class AttentionWExpert(Attention):
                 if hasattr(layer, "reset_parameters"):
                     layer.reset_parameters()
 
+        # Force init weights
+        if hasattr(self, "force_q_proj"):
+            std = 1.0 / math.sqrt(self._force_query_dim)
+            torch.nn.init.trunc_normal_(self.force_q_proj.weight, std=std, a=-3 * std, b=3 * std)
+            std = 1.0 / math.sqrt(self._force_context_dim)
+            torch.nn.init.trunc_normal_(self.force_k_proj.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.trunc_normal_(self.force_v_proj.weight, std=std, a=-3 * std, b=3 * std)
+
+            std = 1.0 / math.sqrt(self._force_inner_dim)
+            torch.nn.init.trunc_normal_(self.force_out_proj.weight, std=std, a=-3 * std, b=3 * std)
+
+            for layer in self.force_q_norm, self.force_k_norm, self.force_v_norm:
+                if hasattr(layer, "reset_parameters"):
+                    layer.reset_parameters()
+
     def compute_qkv(
             self,
             x: torch.Tensor,
@@ -123,7 +162,12 @@ class AttentionWExpert(Attention):
             # Expert-specific
             ex_input: Optional[torch.Tensor] = None,
             ex_rope_emb: Optional[torch.Tensor] = None,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+            # Force-specific
+            force_input: Optional[torch.Tensor] = None,
+            force_rope_emb: Optional[torch.Tensor] = None,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         # Branch [1]: Video
         q = self.q_proj(x)
         is_self_attn = context is None
@@ -145,6 +189,16 @@ class AttentionWExpert(Attention):
             (q_ex, k_ex, v_ex),
         )
 
+        # Branch [3]: Force
+        q_force = self.force_q_proj(force_input)
+        context_force = force_input if is_self_attn else context
+        k_force = self.force_k_proj(context_force)
+        v_force = self.force_v_proj(context_force)
+        q_force, k_force, v_force = map(
+            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.force_n_heads, d=self.force_head_dim),
+            (q_force, k_force, v_force),
+        )
+
         def apply_norm_and_rotary_pos_emb(
             q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             _q_norm: Callable, _k_norm: Callable, _v_norm: Callable,
@@ -161,84 +215,15 @@ class AttentionWExpert(Attention):
         # Branch [1]: Video
         q, k, v = apply_norm_and_rotary_pos_emb(q, k, v, self.q_norm, self.k_norm, self.v_norm, rope_emb)
         # Branch [2]: Expert
-        q_ex, k_ex, v_ex = apply_norm_and_rotary_pos_emb(q_ex, k_ex, v_ex,
-                                                         self.ex_q_norm, self.ex_k_norm, self.ex_v_norm, ex_rope_emb)
+        q_ex, k_ex, v_ex = apply_norm_and_rotary_pos_emb(
+            q_ex, k_ex, v_ex,
+            self.ex_q_norm, self.ex_k_norm, self.ex_v_norm, ex_rope_emb)
+        # Branch [3]: Force
+        q_force, k_force, v_force = apply_norm_and_rotary_pos_emb(
+            q_force, k_force, v_force,
+            self.force_q_norm, self.force_k_norm, self.force_v_norm, force_rope_emb)
 
-        return (q, k, v), (q_ex, k_ex, v_ex)
-
-    @staticmethod
-    def expert_attention_map(
-            q_ex: torch.Tensor,  # (B, S_ex, H, D)
-            k_ex: torch.Tensor,  # (B, S_ex, H, D)
-            v_ex: torch.Tensor,  # (B, S_ex, H, D)  # 仅为接口对齐，本函数不使用
-            *,
-            average_heads: bool = False,  # True -> 返回 (B, S_ex, S_ex)
-    ) -> torch.Tensor:
-        """
-        返回专家分支的注意力图（仅可视化用；无因果/无mask/无scale，且不计算梯度）。
-
-        输入:
-            q_ex, k_ex, v_ex: (B, S_ex, H, D)
-
-        输出:
-            attention_map:
-                - (B, H, S_ex, S_ex) 当 average_heads=False
-                - (B,    S_ex, S_ex) 当 average_heads=True
-        """
-        # assert q_ex.shape == k_ex.shape == v_ex.shape, "q_ex/k_ex/v_ex 形状需一致 (B, S_ex, H, D)"
-        B, S_ex, H, D = q_ex.shape
-
-        # 为数值稳定性，转 float32；返回值也用 float32 便于可视化
-        # q = q_ex.to(torch.float32)  # (B, S_ex, H, D)
-        # k = k_ex.to(torch.float32)  # (B, S_ex, H, D)
-        q = q_ex
-        k = k_ex
-
-        # 点积得到 logits：每个 head 的 (query × key^T)
-        logits = torch.einsum("bqhd,bkhd->bhqk", q, k)  # (B, H, S_ex(q), S_ex(k))
-
-        # 沿最后一维归一化为注意力
-        attn = torch.nn.functional.softmax(logits, dim=-1)  # (B, H, S_ex, S_ex)
-
-        if average_heads:
-            attn = attn.mean(dim=1)  # (B, S1, S2)
-
-        return attn
-
-    @staticmethod
-    def row_entropy(
-        attn: torch.Tensor,                  # (B, H, S1, S2)  行=S1，列=S2；最后一维已softmax
-        *,
-        base: float = 2.0,                   # 2=比特，e=nat，10=Hartley
-        normalize_to_0_1: bool = False,      # True -> 除以 log_base(S2)，得到[0,1]
-        renormalize: bool = False            # True -> 以防万一对每行再归一化
-    ) -> torch.Tensor:
-        """
-        返回: (B*H, S1)  —— 每一行的熵
-        """
-        heads = None
-        if attn.dim() == 4:
-            B, heads, S1, S2 = attn.shape
-            attn = attn.reshape(B * heads, S1, S2)  # (B*H, S1, S2)
-        assert attn.dim() == 3, "attn 形状应为 (B, S1, S2)"
-        B, S1, S2 = attn.shape
-
-        p = attn.to(torch.float32)
-        if renormalize:
-            p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-        p = p.clamp_min(1e-12)                       # 数值安全
-        H = -(p * torch.log(p)).sum(dim=-1)          # 自然底
-        if base != torch.e:
-            H = H / torch.log(torch.tensor(base, dtype=H.dtype, device=H.device))
-
-        if normalize_to_0_1:
-            H = H / (torch.log(torch.tensor(S2, dtype=H.dtype, device=H.device)) /
-                     torch.log(torch.tensor(base, dtype=H.dtype, device=H.device)))
-
-        if heads is not None:
-            H = H.reshape(B // heads, heads, S1)  # (B, H, S1)
-        return H
+        return (q, k, v), (q_ex, k_ex, v_ex), (q_force, k_force, v_force)
 
     def compute_attention(
             self,  q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -246,57 +231,59 @@ class AttentionWExpert(Attention):
             q_ex: Optional[torch.Tensor] = None,
             k_ex: Optional[torch.Tensor] = None,
             v_ex: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+            q_force: Optional[torch.Tensor] = None,
+            k_force: Optional[torch.Tensor] = None,
+            v_force: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         additional_args = {}
         if isinstance(self.attn_op, (NattenA2AAttnOp, NeighborhoodAttention)):
             additional_args["video_size"] = video_size
 
         # Check shapes
-        if self.is_selfattn and q_ex is not None and k_ex is not None and v_ex is not None:
+        if self.is_selfattn and q_ex is not None and k_ex is not None and v_ex is not None \
+                and q_force is not None and k_force is not None and v_force is not None:
             # (B,num_tokens,h,d)
             assert (q.shape[0] == q_ex.shape[0] and q.shape[-2:] == q_ex.shape[-2:]
                     and k.shape[0] == k_ex.shape[0] and k.shape[-2:] == k_ex.shape[-2:]
                     and v.shape[0] == v_ex.shape[0] and v.shape[-2:] == v_ex.shape[-2:]), \
-                f"SA shape: {q.shape}, {k.shape}, {v.shape} != {q_ex.shape}, {k_ex.shape}, {v_ex.shape}"
-            # Branch [1] and [2]: Video and Expert
-            ori_len, expert_len = q.shape[1], q_ex.shape[1]
-            q = torch.cat((q, q_ex), dim=1)
-            k = torch.cat((k, k_ex), dim=1)
-            v = torch.cat((v, v_ex), dim=1)
-            if self.use_attention_entropy:
-                # NOTE: Compute expert attention score for visualization
-                attn_score = self.expert_attention_map(
-                    q_ex, k, v, average_heads=False)  # (B, H, S2, S1+S2)
-                row_entropy = self.row_entropy(
-                    attn_score, base=2.0,
-                )  # shape: (B, H, S2)
-                # print(f"[DEBUG] attn_score: {attn_score.shape}, "
-                #       f"row_entropy: {row_entropy.shape}, mean={row_entropy.mean().item():.4f}, "
-                #       f"min={row_entropy.min().item():.4f}, max={row_entropy.max().item():.4f}, "
-                #       f"std={row_entropy.std().item():.4f}, "
-                #       f"mean_of_max={row_entropy.max(dim=1).values.mean().item():.4f}, "
-                #       f"max_of_mean={row_entropy.mean(dim=1).max().item():.4f}")
-                # self.attention_entropy_loss = row_entropy.mean(dim=(1, 2))  # mean over heads and tokens -> (B,)
-                self.attention_entropy_loss = torch.mean(row_entropy, dim=1)  # mean over heads -> (B,S2)
-                self.attention_entropy_loss = torch.min(self.attention_entropy_loss, dim=1).values  # min over tokens -> (B,)
-            result = self.attn_op(q, k, v, **additional_args)  # (B,S1+S2,H,D)
-            result_ori, result_expert = torch.split(result, [ori_len, expert_len], dim=1)
-        elif not self.is_selfattn and q_ex is not None and k_ex is not None and v_ex is not None:
-            assert q.shape[-2:] == k.shape[-2:], f"CA shape: {q.shape} != {k.shape}, {v.shape}"
-            assert q_ex.shape[-2:] == k_ex.shape[-2:], f"CA shape: {q_ex.shape} != {k_ex.shape}, {v_ex.shape}"
+                f"SA ex shape: {q.shape}, {k.shape}, {v.shape} != {q_ex.shape}, {k_ex.shape}, {v_ex.shape}"
+            assert (q.shape[0] == q_force.shape[0] and q.shape[-2:] == q_force.shape[-2:]
+                    and k.shape[0] == k_force.shape[0] and k.shape[-2:] == k_force.shape[-2:]
+                    and v.shape[0] == v_force.shape[0] and v.shape[-2:] == v_force.shape[-2:]), \
+                f"SA force shape: {q.shape}, {k.shape}, {v.shape} != {q_force.shape}, {k_force.shape}, {v_force.shape}"
+            # Branch [1] and [2] and [3]: Video and Expert and Force
+            ori_len, expert_len, force_len = q.shape[1], q_ex.shape[1], q_force.shape[1]
+            # NOTE: put force between video and action is ok?
+            q = torch.cat((q, q_ex, q_force), dim=1)
+            k = torch.cat((k, k_ex, k_force), dim=1)
+            v = torch.cat((v, v_ex, v_force), dim=1)
+            result = self.attn_op(q, k, v, **additional_args)  # (B,S1+S3+S2,H,D)
+            result_ori, result_expert, result_force = torch.split(
+                result, [ori_len, expert_len, force_len], dim=1)
+        elif not self.is_selfattn and q_ex is not None and k_ex is not None and v_ex is not None \
+                and q_force is not None and k_force is not None and v_force is not None:
+            assert q.shape[-2:] == k.shape[-2:], f"CA ori shape: {q.shape} != {k.shape}, {v.shape}"
+            assert q_ex.shape[-2:] == k_ex.shape[-2:], f"CA ex shape: {q_ex.shape} != {k_ex.shape}, {v_ex.shape}"
+            assert q_force.shape[-2:] == k_force.shape[-2:], f"CA force shape: {q_force.shape} != {k_force.shape}, {v_force.shape}"
             result_ori = self.attn_op(q, k, v, **additional_args)  # (B,S1,H,D)
             result_expert = self.attn_op(q_ex, k_ex, v_ex, **additional_args)  # (B,S2,H,D)
+            result_force = self.attn_op(q_force, k_force, v_force, **additional_args)  # (B,S3,H,D)
         else:
             assert q_ex is None and k_ex is None and v_ex is None, "q_ex, k_ex, v_ex should be all None or not None"
+            assert q_force is None and k_force is None and v_force is None, "q_force, k_force, v_force should be all None or not None"
             result_ori = self.attn_op(q, k, v, **additional_args)  # (B,S1,H,D)
             result_expert = None
+            result_force = None
 
         # Branch [1]: Video
         result_ori = self.output_dropout(self.output_proj(result_ori))
         # Branch [2]: Expert
         result_expert = self.ex_output_dropout(
             self.ex_out_proj(result_expert)) if result_expert is not None else None
-        return result_ori, result_expert
+        # Branch [3]: Force
+        result_force = self.force_output_dropout(
+            self.force_out_proj(result_force)) if result_force is not None else None
+        return result_ori, result_expert, result_force
 
     def forward(
             self,
@@ -307,7 +294,10 @@ class AttentionWExpert(Attention):
             # Expert-specific
             ex_input: Optional[torch.Tensor] = None,
             ex_rope_emb: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Force-specific
+            force_input: Optional[torch.Tensor] = None,
+            force_rope_emb: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # NOTE: In NVIDIA MultiViewDiT, x is (B,V*L,D), context is (B,V*M,D), they are reshaped
         # to (B*V,L,D) and (B*V,M,D) inside Attention forward function to avoid information leak across views.
         # In our setting, x is (B,V*L,D), context is (B,M,D), ex_input is (B,La,D), we will reshape them to
@@ -319,7 +309,6 @@ class AttentionWExpert(Attention):
         needs_reshape = False  # False:static and gripper will attend to each other; True: not attend to each other
         is_self_attn = context is None
         needs_reshape = needs_reshape and is_self_attn and (self._n_cameras > 1)  # only reshape in self-attn with multi-view
-        # print("[DEBUG] AttentionWExpert forward is_self_attn:", is_self_attn, "needs_reshape:", needs_reshape,)
 
         context_B_M_D = context
         if needs_reshape:
@@ -330,13 +319,21 @@ class AttentionWExpert(Attention):
             if ex_input is not None:
                 ex_input = ex_input.unsqueeze(1).repeat(1, n_cameras, 1, 1)  # (B,S,D) -> (B,V,S,D)
                 ex_input = rearrange(ex_input, "B V S D -> (V B) S D", V=n_cameras)
-                # print("[DEBUG] AttentionWExpert forward ex_input reshaped:", ex_input.shape, "ex_rope_emb:", ex_rope_emb.shape)
+            if force_input is not None:
+                force_input = force_input.unsqueeze(1).repeat(1, n_cameras, 1, 1)  # (B,S,D) -> (B,V,S,D)
+                force_input = rearrange(force_input, "B V S D -> (V B) S D", V=n_cameras)
 
         # Original attention forward
-        (q, k, v), (q_ex, k_ex, v_ex) = self.compute_qkv(x, context_B_M_D, rope_emb=rope_emb,
-                                                         ex_input=ex_input, ex_rope_emb=ex_rope_emb)
-        attn_ori, attn_expert = self.compute_attention(q, k, v, video_size=video_size,
-                                                       q_ex=q_ex, k_ex=k_ex, v_ex=v_ex)
+        (q, k, v), (q_ex, k_ex, v_ex), (q_force, k_force, v_force) = self.compute_qkv(
+            x, context_B_M_D, rope_emb=rope_emb,
+            ex_input=ex_input, ex_rope_emb=ex_rope_emb,
+            force_input=force_input, force_rope_emb=force_rope_emb,
+        )
+        attn_ori, attn_expert, attn_force = self.compute_attention(
+            q, k, v, video_size=video_size,
+            q_ex=q_ex, k_ex=k_ex, v_ex=v_ex,
+            q_force=q_force, k_force=k_force, v_force=v_force,
+        )
 
         if needs_reshape:
             # Reshape back
@@ -345,8 +342,11 @@ class AttentionWExpert(Attention):
                 attn_expert = rearrange(attn_expert, "(V B) S D -> B V S D", V=self._n_cameras)
                 ex_multi_view_reduce = "mean"  # "add" or "mean"
                 attn_expert = attn_expert.mean(dim=1) if ex_multi_view_reduce == "mean" else attn_expert.sum(dim=1)
-                # print("[DEBUG] AttentionWExpert forward attn_ori:", attn_ori.shape, "attn_expert:", attn_expert.shape)
-        return attn_ori, attn_expert
+            if attn_force is not None:  # (V*B,S,D) -> (B,S,D)
+                attn_force = rearrange(attn_force, "(V B) S D -> B V S D", V=self._n_cameras)
+                force_multi_view_reduce = "mean"  # "add" or "mean"
+                attn_force = attn_force.mean(dim=1) if force_multi_view_reduce == "mean" else attn_force.sum(dim=1)
+        return attn_ori, attn_expert, attn_force
 
 
 class BlockWExpert(Block):
@@ -367,10 +367,13 @@ class BlockWExpert(Block):
             ex_num_heads: int = 16,
             ex_mlp_ratio: float = 4.0,
             ex_adaln_lora_dim: int = 64,
+            # Force-specific parameters
+            force_dim: int = 256,
+            force_num_heads: int = 16,
+            force_mlp_ratio: float = 4.0,
+            force_adaln_lora_dim: int = 64,
             # Multi-view related parameters
             n_cameras: int = 1,
-            # Attention-Entropy parameters
-            use_attention_entropy: bool = False,
     ):
         super().__init__(x_dim, context_dim, num_heads, mlp_ratio, use_adaln_lora,
                          adaln_lora_dim, self_attention_backend, cross_attention_backend, natten_params)
@@ -387,8 +390,12 @@ class BlockWExpert(Block):
             ex_query_dim=ex_dim,
             ex_n_heads=ex_num_heads,
             ex_head_dim=ex_dim // ex_num_heads,
+            # Force-specific
+            force_query_dim=force_dim,
+            force_n_heads=force_num_heads,
+            force_head_dim=force_dim // force_num_heads,
+            # Multi-view
             n_cameras=n_cameras,
-            use_attention_entropy=use_attention_entropy,  # only for self-attn
         )
 
         self.cross_attn = AttentionWExpert(
@@ -402,6 +409,10 @@ class BlockWExpert(Block):
             ex_query_dim=ex_dim,
             ex_n_heads=ex_num_heads,
             ex_head_dim=ex_dim // ex_num_heads,
+            # Force-specific
+            force_query_dim=force_dim,
+            force_n_heads=force_num_heads,
+            force_head_dim=force_dim // force_num_heads,
         )
 
         # Other expert-specific modules: LayerNorm, adaln, MLP
@@ -436,12 +447,48 @@ class BlockWExpert(Block):
             self.ex_adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(ex_dim, 3 * ex_dim, bias=False))
             self.ex_adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(ex_dim, 3 * ex_dim, bias=False))
 
+        # Other force-specific modules: LayerNorm, adaln, MLP
+        self.force_dim = force_dim
+        self.force_num_heads = force_num_heads
+        self.force_mlp_ratio = force_mlp_ratio
+
+        self.force_layer_norm_self_attn = nn.LayerNorm(force_dim, elementwise_affine=False, eps=1e-6)  # no params
+        self.force_layer_norm_cross_attn = nn.LayerNorm(force_dim, elementwise_affine=False, eps=1e-6)  # no params
+        self.force_layer_norm_mlp = nn.LayerNorm(force_dim, elementwise_affine=False, eps=1e-6)
+
+        self.force_mlp = GPT2FeedForward(force_dim, int(force_dim * force_mlp_ratio))
+
+        if self.use_adaln_lora:
+            self.force_adaln_modulation_self_attn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(force_dim, force_adaln_lora_dim, bias=False),  # force shares the same t_embedding with ori
+                nn.Linear(force_adaln_lora_dim, 3 * force_dim, bias=False),
+            )
+            self.force_adaln_modulation_cross_attn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(force_dim, force_adaln_lora_dim, bias=False),
+                nn.Linear(force_adaln_lora_dim, 3 * force_dim, bias=False),
+            )
+            self.force_adaln_modulation_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(force_dim, force_adaln_lora_dim, bias=False),
+                nn.Linear(force_adaln_lora_dim, 3 * force_dim, bias=False),
+            )
+        else:
+            self.force_adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), nn.Linear(force_dim, 3 * force_dim, bias=False))
+            self.force_adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(force_dim, 3 * force_dim, bias=False))
+            self.force_adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(force_dim, 3 * force_dim, bias=False))
+
     def reset_parameters(self) -> None:
         super().reset_parameters()
 
         self.ex_layer_norm_self_attn.reset_parameters()
         self.ex_layer_norm_cross_attn.reset_parameters()
         self.ex_layer_norm_mlp.reset_parameters()
+
+        self.force_layer_norm_self_attn.reset_parameters()
+        self.force_layer_norm_cross_attn.reset_parameters()
+        self.force_layer_norm_mlp.reset_parameters()
 
         if self.use_adaln_lora:
             std = 1.0 / math.sqrt(self.ex_dim)
@@ -451,10 +498,21 @@ class BlockWExpert(Block):
             torch.nn.init.zeros_(self.ex_adaln_modulation_self_attn[2].weight)
             torch.nn.init.zeros_(self.ex_adaln_modulation_cross_attn[2].weight)
             torch.nn.init.zeros_(self.ex_adaln_modulation_mlp[2].weight)
+
+            std = 1.0 / math.sqrt(self.force_dim)
+            torch.nn.init.trunc_normal_(self.force_adaln_modulation_self_attn[1].weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.trunc_normal_(self.force_adaln_modulation_cross_attn[1].weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.trunc_normal_(self.force_adaln_modulation_mlp[1].weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.zeros_(self.force_adaln_modulation_self_attn[2].weight)
+            torch.nn.init.zeros_(self.force_adaln_modulation_cross_attn[2].weight)
+            torch.nn.init.zeros_(self.force_adaln_modulation_mlp[2].weight)
         else:
             torch.nn.init.zeros_(self.ex_adaln_modulation_self_attn[1].weight)
             torch.nn.init.zeros_(self.ex_adaln_modulation_cross_attn[1].weight)
             torch.nn.init.zeros_(self.ex_adaln_modulation_mlp[1].weight)
+            torch.nn.init.zeros_(self.force_adaln_modulation_self_attn[1].weight)
+            torch.nn.init.zeros_(self.force_adaln_modulation_cross_attn[1].weight)
+            torch.nn.init.zeros_(self.force_adaln_modulation_mlp[1].weight)
 
     def init_weights(self) -> None:
         self.reset_parameters()  # reset expert LayerNorm and adaln
@@ -462,6 +520,7 @@ class BlockWExpert(Block):
         self.cross_attn.init_weights()  # AttentionWExpert
         self.mlp.init_weights()
         self.ex_mlp.init_weights()  # init expert MLP
+        self.force_mlp.init_weights()  # init force MLP
 
     def forward(
             self,
@@ -476,23 +535,12 @@ class BlockWExpert(Block):
             ex_rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
             ex_t_embedding_B_T_D: Optional[torch.Tensor] = None,
             ex_adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+            # Force-specific
+            force_B_T_1_W_D: Optional[torch.Tensor] = None,  # (B,4,1,8,512)
+            force_rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+            force_t_embedding_B_T_D: Optional[torch.Tensor] = None,
+            force_adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
     ):
-        # print("[DEBUG] Enter BlockWExpert forward", "x_B_T_H_W_D:", x_B_T_H_W_D.shape,
-        #       "emb_B_T_D:", emb_B_T_D.shape, "rope_emb_L_1_1_D:", rope_emb_L_1_1_D.shape,
-        #       "adaln_lora_B_T_3D:", adaln_lora_B_T_3D.shape,
-        #       "ex_B_T_1_W_D:", ex_B_T_1_W_D.shape, "ex_rope_emb_L_1_1_D:", ex_rope_emb_L_1_1_D.shape,
-        #       "ex_t_embedding_B_T_D:", ex_t_embedding_B_T_D.shape,
-        #       "ex_adaln_lora_B_T_3D:", ex_adaln_lora_B_T_3D.shape)
-        '''
-        x_B_T_H_W_D: torch.Size([12, 2, 16, 16, 2048]) 
-        emb_B_T_D: torch.Size([12, 2, 2048]) 
-        rope_emb_L_1_1_D: torch.Size([512, 1, 1, 128]) 
-        adaln_lora_B_T_3D: torch.Size([12, 2, 6144]) 
-        ex_B_T_1_W_D: torch.Size([12, 16, 1, 4, 512]) 
-        ex_rope_emb_L_1_1_D: torch.Size([64, 1, 1, 128])
-        ex_t_embedding_B_T_D: torch.Size([12, 12, 512]) 
-        ex_adaln_lora_B_T_3D: torch.Size([12, 12, 1536])
-        '''
         #### <<<< Copied from parent class <<<< ####
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
@@ -573,12 +621,52 @@ class BlockWExpert(Block):
         #### >>>>>>>>> End >>>>>>>>>> ####
 
 
+        #### <<<< Branch [3]: Force adaln <<<< ####
+        if self.use_adaln_lora:
+            force_shift_self_attn_B_T_D, force_scale_self_attn_B_T_D, force_gate_self_attn_B_T_D = (
+                    self.force_adaln_modulation_self_attn(force_t_embedding_B_T_D) + force_adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+            force_shift_cross_attn_B_T_D, force_scale_cross_attn_B_T_D, force_gate_cross_attn_B_T_D = (
+                    self.force_adaln_modulation_cross_attn(force_t_embedding_B_T_D) + force_adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+            force_shift_mlp_B_T_D, force_scale_mlp_B_T_D, force_gate_mlp_B_T_D = (
+                    self.force_adaln_modulation_mlp(force_t_embedding_B_T_D) + force_adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+        else:
+            force_shift_self_attn_B_T_D, force_scale_self_attn_B_T_D, force_gate_self_attn_B_T_D = (
+                self.force_adaln_modulation_self_attn(
+                force_t_embedding_B_T_D
+            ).chunk(3, dim=-1))
+            force_shift_cross_attn_B_T_D, force_scale_cross_attn_B_T_D, force_gate_cross_attn_B_T_D = (
+                self.force_adaln_modulation_cross_attn(
+                force_t_embedding_B_T_D
+            ).chunk(3, dim=-1))
+            force_shift_mlp_B_T_D, force_scale_mlp_B_T_D, force_gate_mlp_B_T_D = (
+                self.force_adaln_modulation_mlp(force_t_embedding_B_T_D).chunk(3, dim=-1))
+
+        # Reshape tensors from (B, T, D) to (B, T, 1, 1, D) for broadcasting
+        force_shift_self_attn_B_T_1_1_D = rearrange(force_shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
+        force_scale_self_attn_B_T_1_1_D = rearrange(force_scale_self_attn_B_T_D, "b t d -> b t 1 1 d")
+        force_gate_self_attn_B_T_1_1_D = rearrange(force_gate_self_attn_B_T_D, "b t d -> b t 1 1 d")
+
+        force_shift_cross_attn_B_T_1_1_D = rearrange(force_shift_cross_attn_B_T_D, "b t d -> b t 1 1 d")
+        force_scale_cross_attn_B_T_1_1_D = rearrange(force_scale_cross_attn_B_T_D, "b t d -> b t 1 1 d")
+        force_gate_cross_attn_B_T_1_1_D = rearrange(force_gate_cross_attn_B_T_D, "b t d -> b t 1 1 d")
+
+        force_shift_mlp_B_T_1_1_D = rearrange(force_shift_mlp_B_T_D, "b t d -> b t 1 1 d")
+        force_scale_mlp_B_T_1_1_D = rearrange(force_scale_mlp_B_T_D, "b t d -> b t 1 1 d")
+        force_gate_mlp_B_T_1_1_D = rearrange(force_gate_mlp_B_T_D, "b t d -> b t 1 1 d")
+
+        B, T_force, H_force, W_force, D_force = force_B_T_1_W_D.shape
+        #### >>>>>>>>> End >>>>>>>>>> ####
+
+
         #### <<<< Copied from parent class <<<< ####
         # (1) Self-Attention
         def _fn(_x_B_T_H_W_D, _norm_layer, _scale_B_T_1_1_D, _shift_B_T_1_1_D):
             return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
 
-        # (1.1) LayerNorm + AdaLN
+        # (1.1)[1] LayerNorm + AdaLN
         normalized_x_B_T_H_W_D = _fn(
             x_B_T_H_W_D,
             self.layer_norm_self_attn,
@@ -588,13 +676,20 @@ class BlockWExpert(Block):
         #### >>>>>>>>> End >>>>>>>>>> ####
 
 
-        #### <<<< Branch [2]: Expert Self-Attention, Cross-Attention <<<< ####
-        # [2](1.1) LayerNorm + AdaLN
+        #### <<<< Branch [2,3]: Expert Self-Attention, Cross-Attention <<<< ####
+        # (1.1)[2] LayerNorm + AdaLN
         ex_normalized_B_T_H_W_D = _fn(
             ex_B_T_1_W_D,
             self.ex_layer_norm_self_attn,
             ex_scale_self_attn_B_T_1_1_D,
             ex_shift_self_attn_B_T_1_1_D,
+        )
+        # (1.1)[3] LayerNorm + AdaLN
+        force_normalized_B_T_H_W_D = _fn(
+            force_B_T_1_W_D,
+            self.force_layer_norm_self_attn,
+            force_scale_self_attn_B_T_1_1_D,
+            force_shift_self_attn_B_T_1_1_D,
         )
 
         video_size = VideoSize(T=T, H=H, W=W)
@@ -602,8 +697,8 @@ class BlockWExpert(Block):
         if self.cp_size is not None and self.cp_size > 1:
             video_size = VideoSize(T=T * self.cp_size, H=H, W=W)
 
-        # [2](1.2) Self-Attention + RoPE + AdaLN
-        result_B_S_D, ex_result_B_S_D = self.self_attn.forward(
+        # (1.2)[1,2,3] Self-Attention + RoPE + AdaLN
+        result_B_S_D, ex_result_B_S_D, force_result_B_S_D = self.self_attn.forward(
             rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
             None,
             rope_emb=rope_emb_L_1_1_D,
@@ -611,14 +706,19 @@ class BlockWExpert(Block):
             # Expert-specific
             ex_input=rearrange(ex_normalized_B_T_H_W_D, "b t 1 w d -> b (t 1 w) d"),
             ex_rope_emb=ex_rope_emb_L_1_1_D,
+            # Force-specific
+            force_input=rearrange(force_normalized_B_T_H_W_D, "b t 1 w d -> b (t 1 w) d"),
+            force_rope_emb=force_rope_emb_L_1_1_D,
         )
         result_B_T_H_W_D = rearrange(result_B_S_D, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
         ex_result_B_T_1_W_D = rearrange(ex_result_B_S_D, "b (t 1 w) d -> b t 1 w d", t=T_ex, w=W_ex)
+        force_result_B_T_1_W_D = rearrange(force_result_B_S_D, "b (t 1 w) d -> b t 1 w d", t=T_force, w=W_force)
 
         x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result_B_T_H_W_D
         ex_B_T_1_W_D = ex_B_T_1_W_D + ex_gate_self_attn_B_T_1_1_D * ex_result_B_T_1_W_D
+        force_B_T_1_W_D = force_B_T_1_W_D + force_gate_self_attn_B_T_1_1_D * force_result_B_T_1_W_D
 
-        # [2](2) Cross-Attention
+        # (2) Cross-Attention
         def _x_fn(
             _x_B_T_H_W_D: torch.Tensor,
             layer_norm_cross_attn: Callable,
@@ -629,29 +729,41 @@ class BlockWExpert(Block):
             _ex_layer_norm_cross_attn: Callable,
             _ex_scale_cross_attn_B_T_1_1_D: torch.Tensor,
             _ex_shift_cross_attn_B_T_1_1_D: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Force-specific
+            _force_B_T_1_W_D: torch.Tensor,
+            _force_layer_norm_cross_attn: Callable,
+            _force_scale_cross_attn_B_T_1_1_D: torch.Tensor,
+            _force_shift_cross_attn_B_T_1_1_D: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             _normalized_x_B_T_H_W_D = _fn(
                 _x_B_T_H_W_D, layer_norm_cross_attn, _scale_cross_attn_B_T_1_1_D, _shift_cross_attn_B_T_1_1_D
             )
             _normalized_ex_B_T_1_W_D = _fn(
                 _ex_B_T_1_W_D, _ex_layer_norm_cross_attn, _ex_scale_cross_attn_B_T_1_1_D, _ex_shift_cross_attn_B_T_1_1_D
             )
+            _normalized_force_B_T_1_W_D = _fn(
+                _force_B_T_1_W_D, _force_layer_norm_cross_attn, _force_scale_cross_attn_B_T_1_1_D, _force_shift_cross_attn_B_T_1_1_D
+            )
 
-            _result_B_S_D, _ex_result_B_S_D = self.cross_attn.forward(
+            _result_B_S_D, _ex_result_B_S_D, _force_result_B_S_D = self.cross_attn.forward(
                 rearrange(_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
                 crossattn_emb,
                 rope_emb=rope_emb_L_1_1_D,
                 # Expert-specific
                 ex_input=rearrange(_normalized_ex_B_T_1_W_D, "b t 1 w d -> b (t 1 w) d"),
                 ex_rope_emb=ex_rope_emb_L_1_1_D,
+                # Force-specific
+                force_input=rearrange(_normalized_force_B_T_1_W_D, "b t 1 w d -> b (t 1 w) d"),
+                force_rope_emb=force_rope_emb_L_1_1_D,
             )
             _result_B_T_H_W_D = rearrange(_result_B_S_D, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
             _ex_result_B_T_1_W_D = rearrange(_ex_result_B_S_D, "b (t 1 w) d -> b t 1 w d", t=T_ex, w=W_ex)
-            return _result_B_T_H_W_D, _ex_result_B_T_1_W_D
+            _force_result_B_T_1_W_D = rearrange(_force_result_B_S_D, "b (t 1 w) d -> b t 1 w d", t=T_force, w=W_force)
+            return _result_B_T_H_W_D, _ex_result_B_T_1_W_D, _force_result_B_T_1_W_D
 
-        # [2](2.1) LayerNorm + AdaLN
-        # [2](2.2) Cross-Attention + AdaLN
-        result_B_T_H_W_D, ex_result_B_T_1_W_D = _x_fn(
+        # (2.1)[1,2,3] LayerNorm + AdaLN
+        # (2.2)[1,2,3] Cross-Attention + AdaLN
+        result_B_T_H_W_D, ex_result_B_T_1_W_D, force_result_B_T_1_W_D = _x_fn(
             x_B_T_H_W_D,
             self.layer_norm_cross_attn,
             scale_cross_attn_B_T_1_1_D,
@@ -661,41 +773,60 @@ class BlockWExpert(Block):
             self.ex_layer_norm_cross_attn,
             ex_scale_cross_attn_B_T_1_1_D,
             ex_shift_cross_attn_B_T_1_1_D,
+            # Force-specific
+            force_B_T_1_W_D,
+            self.force_layer_norm_cross_attn,
+            force_scale_cross_attn_B_T_1_1_D,
+            force_shift_cross_attn_B_T_1_1_D,
         )
         x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
         ex_B_T_1_W_D = ex_result_B_T_1_W_D * ex_gate_cross_attn_B_T_1_1_D + ex_B_T_1_W_D
+        force_B_T_1_W_D = force_result_B_T_1_W_D * force_gate_cross_attn_B_T_1_1_D + force_B_T_1_W_D
         #### >>>>>>>>> End >>>>>>>>>> ####
 
 
         #### <<<< Copied from parent class <<<< ####
         # (3) MLP
-        # (3.1) LayerNorm + AdaLN
+        # (3.1)[1] LayerNorm + AdaLN
         normalized_x_B_T_H_W_D = _fn(
             x_B_T_H_W_D,
             self.layer_norm_mlp,
             scale_mlp_B_T_1_1_D,
             shift_mlp_B_T_1_1_D,
         )
-        # (3.2) MLP + AdaLN
+        # (3.2)[1] MLP + AdaLN
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
         #### >>>>>>>>> End >>>>>>>>>> ####
 
 
-        #### <<<< Branch [2]: Expert MLP <<<< ####
-        # [2](3) MLP
-        # [2](3.1) LayerNorm + AdaLN
+        #### <<<< Branch [2,3]: Expert MLP <<<< ####
+        # (3)[2] MLP
+        # (3.1)[2] LayerNorm + AdaLN
         ex_normalized_x_B_T_1_W_D = _fn(
             ex_B_T_1_W_D,
             self.ex_layer_norm_mlp,
             ex_scale_mlp_B_T_1_1_D,
             ex_shift_mlp_B_T_1_1_D,
         )
-        # [2](3.2) MLP + AdaLN
+        # (3)[3] MLP
+        # (3.1)[3] LayerNorm + AdaLN
+        force_normalized_x_B_T_1_W_D = _fn(
+            force_B_T_1_W_D,
+            self.force_layer_norm_mlp,
+            force_scale_mlp_B_T_1_1_D,
+            force_shift_mlp_B_T_1_1_D,
+        )
+
+        # (3.2)[2] MLP + AdaLN
         ex_result_B_T_1_W_D = self.ex_mlp(ex_normalized_x_B_T_1_W_D)
         ex_B_T_1_W_D = ex_B_T_1_W_D + ex_gate_mlp_B_T_1_1_D * ex_result_B_T_1_W_D
-        return x_B_T_H_W_D, ex_B_T_1_W_D  # original and expert outputs
+        # (3.2)[3] MLP + AdaLN
+        force_result_B_T_1_W_D = self.force_mlp(force_normalized_x_B_T_1_W_D)
+        force_B_T_1_W_D = force_B_T_1_W_D + force_gate_mlp_B_T_1_1_D * force_result_B_T_1_W_D
         #### >>>>>>>>> End >>>>>>>>>> ####
+
+        return x_B_T_H_W_D, ex_B_T_1_W_D, force_B_T_1_W_D  # original and expert and force outputs
 
 
 class Mlp(nn.Module):
@@ -755,9 +886,10 @@ class ActionDecoder(nn.Module):
 # Modified: models/video2world_action_dit.py ActionConditionedMinimalV1LVGDiT
 class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
     def __init__(self, *args, **kwargs):
-        assert "action_dim" in kwargs, "action_dim must be provided"
+        assert "action_dim" and "force_raw_dim" in kwargs, "action_dim and force_raw_dim must be provided"
         action_dim = kwargs["action_dim"]
-        del kwargs["action_dim"]
+        force_raw_dim = kwargs["force_raw_dim"]
+        del kwargs["action_dim"], kwargs["force_raw_dim"]
 
         # Default parameters
         if kwargs.get("mlp_ratio") is None:
@@ -776,6 +908,18 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         ex_adaln_lora_dim = kwargs["ex_adaln_lora_dim"]
         del kwargs["action_dof"], kwargs['ex_num_latent_frames'], kwargs["ex_num_tokens_per_latent_frame"], (
             kwargs)["ex_dim"], (kwargs)["ex_num_heads"], kwargs["ex_mlp_ratio"], kwargs["ex_adaln_lora_dim"]
+
+        # Force-specific parameters: force<->ex, force_raw<->action
+        assert "force_dim" in kwargs, "force_dim must be provided"
+        force_raw_dof = kwargs["force_raw_dof"]
+        force_num_latent_frames = int(kwargs["force_num_latent_frames"])
+        force_num_tokens_per_latent_frame = int(kwargs["force_num_tokens_per_latent_frame"])
+        force_dim = kwargs["force_dim"]
+        force_num_heads = kwargs["force_num_heads"]
+        force_mlp_ratio = kwargs["force_mlp_ratio"]
+        force_adaln_lora_dim = kwargs["force_adaln_lora_dim"]
+        del kwargs["force_raw_dof"], kwargs['force_num_latent_frames'], kwargs["force_num_tokens_per_latent_frame"], (
+            kwargs)["force_dim"], (kwargs)["force_num_heads"], kwargs["force_mlp_ratio"], kwargs["force_adaln_lora_dim"]
 
         # Additional cross-attn parameters: robot states
         assert "extra_robot_states_dim" in kwargs, "extra_robot_states_dim must be provided"
@@ -810,28 +954,26 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             TimestepEmbedding(ex_dim, ex_dim, use_adaln_lora=kwargs["use_adaln_lora"]),
         )
         self.action_t_embedding_norm = te.pytorch.RMSNorm(ex_dim, eps=1e-6)
-        # self.action_embedder_B_D = Mlp(
-        #     in_features=action_dim,
-        #     hidden_features=ex_dim * 2,  # How large the hidden layer should be?
-        #     out_features=ex_dim * ex_num_latent_frames,
-        #     act_layer=lambda: nn.GELU(approximate="tanh"),
-        #     drop=0,
-        # )
         self.action_embedder_B_D = ActionEncoder(
             in_features=action_dim + (action_dim // action_dof),  # 1 means the conditioning mask
             output_dim=ex_dim * ex_num_latent_frames,
         )
-        # NOTE: action is no more taken as the crossattn_emb
-        # self.action_embedder_B_3D = Mlp(
-        #     in_features=action_dim,
-        #     hidden_features=self.model_channels * 4,
-        #     out_features=self.model_channels * 3,
-        #     act_layer=lambda: nn.GELU(approximate="tanh"),
-        #     drop=0,
-        # )
+
+        # Add force encoder
+        self.force_dim = force_dim
+        self.force_num_latent_frames = force_num_latent_frames
+        self.force_t_embedder = nn.Sequential(
+            Timesteps(force_dim),
+            TimestepEmbedding(force_dim, force_dim, use_adaln_lora=kwargs["use_adaln_lora"]),
+        )
+        self.force_t_embedding_norm = te.pytorch.RMSNorm(force_dim, eps=1e-6)
+        self.force_embedder_B_D = ActionEncoder(
+            in_features=force_raw_dim + (force_raw_dim // force_raw_dof),  # 1 means the conditioning mask
+            output_dim=force_dim * force_num_latent_frames,
+        )
 
         # Add robot states (agent_pos) encoder
-        # (1) For video branch, same dim as time embedding
+        # [1] For video branch, same dim as time embedding
         self.agent_pos_video_embedder_B_D = Mlp(
             in_features=extra_robot_states_dim,
             hidden_features=extra_robot_states_dim * 4,
@@ -846,7 +988,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             act_layer=lambda: nn.GELU(approximate="tanh"),
             drop=0,
         )
-        # (2) For expert branch, same dim as action time embedding
+        # [2] For expert branch, same dim as action time embedding
         self.agent_pos_action_embedder_B_D = Mlp(
             in_features=extra_robot_states_dim,
             hidden_features=extra_robot_states_dim * 4,
@@ -858,6 +1000,21 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             in_features=extra_robot_states_dim,
             hidden_features=extra_robot_states_dim * 4,
             out_features=self.ex_dim * 3,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
+        # [3] For force branch, same dim as force time embedding
+        self.agent_pos_force_embedder_B_D = Mlp(
+            in_features=extra_robot_states_dim,
+            hidden_features=extra_robot_states_dim * 4,
+            out_features=self.force_dim,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
+        self.agent_pos_force_embedder_B_3D = Mlp(
+            in_features=extra_robot_states_dim,
+            hidden_features=extra_robot_states_dim * 4,
+            out_features=self.force_dim * 3,
             act_layer=lambda: nn.GELU(approximate="tanh"),
             drop=0,
         )
@@ -885,23 +1042,19 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
                     ex_num_heads=ex_num_heads,
                     ex_mlp_ratio=ex_mlp_ratio,
                     ex_adaln_lora_dim=ex_adaln_lora_dim,
+                    # Force-specific
+                    force_dim=force_dim,
+                    force_num_heads=force_num_heads,
+                    force_mlp_ratio=force_mlp_ratio,
+                    force_adaln_lora_dim=force_adaln_lora_dim,
                     # Multi-view related
                     n_cameras=self.n_cameras_emb,
-                    # Online Attention Entropy
-                    use_attention_entropy=(i < self.online_attention_entropy_layers),
                 )
                 for i in range(num_blocks)
             ]
         )
 
         # Add action decoder
-        # self.action_decoder_B_D = Mlp(
-        #     in_features=ex_dim * ex_num_latent_frames * ex_num_tokens_per_latent_frame,
-        #     hidden_features=action_dim * 4,  # can be simpler
-        #     out_features=action_dim,  # action_dim = horizon * action_dof
-        #     act_layer=lambda: nn.GELU(approximate="tanh"),
-        #     drop=0,
-        # )
         self.action_decoder_B_D = ActionDecoder(
             in_features=ex_dim * ex_num_latent_frames * ex_num_tokens_per_latent_frame,
             output_dim=action_dim,
@@ -910,6 +1063,16 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         self.ex_num_tokens_per_latent_frame = ex_num_tokens_per_latent_frame
         self.action_reshape = lambda act_B_TD: rearrange(
             act_B_TD, "b (t d) -> b t d", d=action_dof)
+
+        # Add force decoder
+        self.force_decoder_B_D = ActionDecoder(
+            in_features=force_dim * force_num_latent_frames * force_num_tokens_per_latent_frame,
+            output_dim=force_raw_dim,
+        )
+        self.force_raw_dof = force_raw_dof
+        self.force_num_tokens_per_latent_frame = force_num_tokens_per_latent_frame
+        self.force_reshape = lambda force_B_TD: rearrange(
+            force_B_TD, "b (t d) -> b t d", d=force_raw_dof)
 
         # Add view embedding
         if self.concat_view_embedding:
@@ -926,15 +1089,23 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             self.action_embedder_B_D.init_weights()
             self.action_decoder_B_D.init_weights()
             self.action_t_embedding_norm.reset_parameters()
+        if hasattr(self, "force_decoder_B_D"):
+            self.force_t_embedder[1].init_weights()
+            self.force_embedder_B_D.init_weights()
+            self.force_decoder_B_D.init_weights()
+            self.force_t_embedding_norm.reset_parameters()
         if hasattr(self, "agent_pos_video_embedder_B_D"):
             self.agent_pos_video_embedder_B_D.init_weights()
             self.agent_pos_video_embedder_B_3D.init_weights()
             self.agent_pos_action_embedder_B_D.init_weights()
             self.agent_pos_action_embedder_B_3D.init_weights()
+            self.agent_pos_force_embedder_B_D.init_weights()
+            self.agent_pos_force_embedder_B_3D.init_weights()
 
     def freeze_expert(self, freezing: bool = True) -> None:
         total_params = 0
         expert_params = 0
+        force_params = 0
         base_params = 0
 
         for name, param in self.named_parameters():
@@ -943,18 +1114,21 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             if param.requires_grad:
                 total_params += param_count
             else:
-                continue
+                continue  # skip already frozen parameters
 
             if ('ex_' in name or 'expert' in name
                     or 'action' in name or 'agent_pos' in name
                     or 'view_embeddings' in name):
                 expert_params += param.numel()
                 param.requires_grad = not freezing
+            elif ('force' in name):
+                force_params += param.numel()
             else:
                 base_params += param.numel()
         print(f"[DEBUG] [ExpertMinimalV1LVGDiT] Freeze Expert: "
               f"total_params trainable: {total_params / 1_000_000:.2f}M, "
               f"expert_params trainable->frozen={freezing}: {expert_params / 1_000_000:.2f}M, "
+              f"force_params trainable: {force_params / 1_000_000:.2f}M, "
               f"base_params trainable: {base_params / 1_000_000:.2f}M")
 
     def count_parameters(self) -> int:
@@ -962,10 +1136,13 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         trainable_params = 0
 
         expert_params = 0
+        force_params = 0
         base_params = 0
         action_embedder_params = 0
         action_decoder_params = 0
         agent_pos_embedder_params = 0
+        force_embedder_params = 0
+        force_decoder_params = 0
 
         for name, param in self.named_parameters():
             param_count = param.numel()
@@ -984,6 +1161,12 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
                     action_embedder_params += param.numel()
                 elif 'action_decoder_B_D' in name:
                     action_decoder_params += param.numel()
+            elif ('force' in name):
+                force_params += param.numel()
+                if 'force_embedder_B_D' in name:
+                    force_embedder_params += param.numel()
+                elif 'force_decoder_B_D' in name:
+                    force_decoder_params += param.numel()
             else:
                 base_params += param.numel()
 
@@ -994,6 +1177,9 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             'expert_parameters (M)': expert_params / 1_000_000,
             'action_embedder_parameters (M)': action_embedder_params / 1_000_000,
             'action_decoder_parameters (M)': action_decoder_params / 1_000_000,
+            'force_parameters (M)': force_params / 1_000_000,
+            'force_embedder_parameters (M)': force_embedder_params / 1_000_000,
+            'force_decoder_parameters (M)': force_decoder_params / 1_000_000,
             'agent_pos_embedder_parameters (M)': agent_pos_embedder_params / 1_000_000,
             'base_parameters (M)': base_params / 1_000_000,
             'total_size_mb': total_params * 4 / (1024 * 1024),  # 假设float32
@@ -1013,9 +1199,14 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         padding_mask: Optional[torch.Tensor] = None,
         data_type: Optional[DataType] = DataType.VIDEO,
         use_cuda_graphs: bool = False,
+        # Actions
         action_B_T_D: Optional[torch.Tensor] = None,  # as self-attn input rather than cross-attn kv
         action_timesteps_B_T: Optional[torch.Tensor] = None,  # due to different mask length, this can be different from timesteps_B_T
         condition_action_input_mask_B_T_D: Optional[torch.Tensor] = None,
+        # Forces
+        force_B_T_D: Optional[torch.Tensor] = None,  # as self-attn input rather than cross-attn kv
+        force_timesteps_B_T: Optional[torch.Tensor] = None,  # due to different mask length, this can be different from timesteps_B_T
+        condition_force_input_mask_B_T_D: Optional[torch.Tensor] = None,
         # Robot states
         agent_pos: Optional[torch.Tensor] = None,  # (B,T,8)
         # Multi-view related
@@ -1029,8 +1220,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         if data_type == DataType.VIDEO:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
             action_B_T_D = torch.cat([action_B_T_D, condition_action_input_mask_B_T_D.type_as(action_B_T_D)], dim=2)
-            # print("[DEBUG] dit.forward", "cond_v_mask", condition_video_input_mask_B_C_T_H_W.shape, condition_video_input_mask_B_C_T_H_W[0],
-            #       "\ncond_a_mask", condition_action_input_mask_B_T_D.shape, condition_action_input_mask_B_T_D[0])
+            force_B_T_D = torch.cat([force_B_T_D, condition_force_input_mask_B_T_D.type_as(force_B_T_D)], dim=2)
         else:
             B, _, T, H, W = x_B_C_T_H_W.shape
             x_B_C_T_H_W = torch.cat(
@@ -1038,6 +1228,7 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             )
         # x_B_C_T_H_W torch.Size([12, 17, 5*, 32, 32])
 
+        # Branch [2]: Action embedding
         # NOTE: project action to action embedding, action:(B,horizon,act_dim)
         assert action_B_T_D is not None, "action must be provided"
         B, C, T, _, _ = x_B_C_T_H_W.shape  # (B,16+1,4,32,32)
@@ -1048,61 +1239,68 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             t=self.ex_num_latent_frames,
         )  # (B,ex_num_latent_frames,1,1,ex_dim)
         assert action_emb_B_T_1_1_D.shape[-1] == self.ex_dim, f"action_emb {action_emb_B_T_1_1_D.shape} != {self.ex_dim}"
-        # action_emb_B_3D = self.action_embedder_B_3D(action)
 
-        # NOTE: project agent_pos to video branch and expert branch
+        # Branch [3]: Force embedding
+        # NOTE: project force to force embedding, force:(B,horizon,force_raw_dim)
+        assert force_B_T_D is not None, "force must be provided"
+        force_B_1_TD = rearrange(force_B_T_D, "b t d -> b 1 (t d)")
+        force_emb_B_1_TWD = self.force_embedder_B_D(force_B_1_TD)  # ->(B,1,T*D)
+        force_emb_B_T_1_1_D = rearrange(
+            force_emb_B_1_TWD, "b 1 (t d) -> b t 1 1 d",
+            t=self.force_num_latent_frames,
+        )  # (B,force_num_latent_frames,1,1,force_dim)
+        assert force_emb_B_T_1_1_D.shape[-1] == self.force_dim, f"force_emb {force_emb_B_T_1_1_D.shape} != {self.force_dim}"
+
+        # Branch [1,2,3]: Robot states embedding
+        # NOTE: project agent_pos to video branch and expert and force branch
         assert agent_pos is not None, "agent_pos must be provided"
         agent_pos = rearrange(agent_pos, "b t d -> b 1 (t d)")
         agent_pos_video_emb_B_D = self.agent_pos_video_embedder_B_D(agent_pos)
         agent_pos_video_emb_B_3D = self.agent_pos_video_embedder_B_3D(agent_pos)
         agent_pos_action_emb_B_D = self.agent_pos_action_embedder_B_D(agent_pos)
         agent_pos_action_emb_B_3D = self.agent_pos_action_embedder_B_3D(agent_pos)
+        agent_pos_force_emb_B_D = self.agent_pos_force_embedder_B_D(agent_pos)
+        agent_pos_force_emb_B_3D = self.agent_pos_force_embedder_B_3D(agent_pos)
 
         assert isinstance(
             data_type, DataType
         ), f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
         assert not (self.training and use_cuda_graphs), "CUDA Graphs are supported only for inference"
         (x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-         action_emb_B_T_1_W_D, action_rope_emb_L_1_1_D) = (
+         action_emb_B_T_1_W_D, action_rope_emb_L_1_1_D,
+         force_emb_B_T_1_W_D, force_rope_emb_L_1_1_D,) = (
             self.prepare_embedded_sequence(
             x_B_C_T_H_W,
             action_emb_B_T_1_1_D,  # NOTE: add action embedding as additional input
+            force_emb_B_T_1_1_D,  # NOTE: add force embedding as additional input
             fps=fps,
             padding_mask=padding_mask,
         ))
-        # print("[DEBUG] dit.embedding:",
-        #       "\nx_B_T_H_W_D", x_B_T_H_W_D.shape,
-        #       "\naction_emb_B_T_1_W_D", action_emb_B_T_1_W_D.shape)
-        '''
-        x_B_T_H_W_D torch.Size([12, 2*5, 16, 16, 2048]) 
-        action_emb_B_T_1_W_D torch.Size([12, 12, 1, 1, 512])
-        rope_emb_L_1_1_D.shape: torch.Size([1088, 1, 1, 128]) 
-        crossattn_emb.shape: torch.Size([12, 512, 1024])
-        '''
 
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
         if action_timesteps_B_T.ndim == 1:
             action_timesteps_B_T = action_timesteps_B_T.unsqueeze(1)
+        if force_timesteps_B_T.ndim == 1:
+            force_timesteps_B_T = force_timesteps_B_T.unsqueeze(1)
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         action_t_embedding_B_T_D, action_adaln_lora_B_T_3D = self.action_t_embedder(action_timesteps_B_T)
-
-        #### NOTE: original NVIDIA action conditioned implementation
-        # # NOTE: add action embedding to the timestep embedding and adaln_lora
-        # t_embedding_B_T_D = t_embedding_B_T_D + action_emb_B_D
-        # adaln_lora_B_T_3D = adaln_lora_B_T_3D + action_emb_B_3D
-        #### END
+        force_t_embedding_B_T_D, force_adaln_lora_B_T_3D = self.force_t_embedder(force_timesteps_B_T)
 
         # NOTE: follow NVIDIA AdaLN, sum the timestep embedding and agent_pos embedding before normalization
-        # (1) Video branch
+        # [1] Video branch
         t_embedding_B_T_D = t_embedding_B_T_D + agent_pos_video_emb_B_D
         adaln_lora_B_T_3D = adaln_lora_B_T_3D + agent_pos_video_emb_B_3D
-        # (1) Action branch
+        # [2] Action branch
         action_t_embedding_B_T_D = action_t_embedding_B_T_D + agent_pos_action_emb_B_D
         action_adaln_lora_B_T_3D = action_adaln_lora_B_T_3D + agent_pos_action_emb_B_3D
+        # [3] Expert branch
+        force_t_embedding_B_T_D = force_t_embedding_B_T_D + agent_pos_force_emb_B_D
+        force_adaln_lora_B_T_3D = force_adaln_lora_B_T_3D + agent_pos_force_emb_B_3D
 
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
         action_t_embedding_B_T_D = self.action_t_embedding_norm(action_t_embedding_B_T_D)
+        force_t_embedding_B_T_D = self.force_t_embedding_norm(force_t_embedding_B_T_D)
 
         # for logging purpose
         affline_scale_log_info = {}
@@ -1138,34 +1336,19 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             "ex_rope_emb_L_1_1_D": action_rope_emb_L_1_1_D,
             "ex_t_embedding_B_T_D": action_t_embedding_B_T_D,
             "ex_adaln_lora_B_T_3D": action_adaln_lora_B_T_3D,
+            "force_rope_emb_L_1_1_D": force_rope_emb_L_1_1_D,
+            "force_t_embedding_B_T_D": force_t_embedding_B_T_D,
+            "force_adaln_lora_B_T_3D": force_adaln_lora_B_T_3D,
         }  # fixed for all blocks
-        if hasattr(self, 'attention_entropy_list'):
-            del self.attention_entropy_list
         for block in blocks:
-            # print("[DEBUG] dit.forward: before block", "action_emb_B_T_1_W_D", action_emb_B_T_1_W_D.shape,)
-            block: BlockWExpert
-            x_B_T_H_W_D, action_emb_B_T_1_W_D = block(
+            x_B_T_H_W_D, action_emb_B_T_1_W_D, force_emb_B_T_1_W_D = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
                 crossattn_emb,
                 ex_B_T_1_W_D=action_emb_B_T_1_W_D,  # (B,4,1,8,512)
+                force_B_T_1_W_D=force_emb_B_T_1_W_D,  # (B,4,1,8,512)
                 **block_kwargs,
             )
-
-            # Cache attention entropy for loss calculation during online update
-            if block.self_attn.use_attention_entropy:
-                if not hasattr(self, 'attention_entropy_list'):
-                    self.attention_entropy_list = []
-                self.attention_entropy_list.append(block.self_attn.attention_entropy_loss)  # each shape: (B,)
-
-        if hasattr(self, 'attention_entropy_list'):
-            attention_entropy_loss_B = torch.stack(self.attention_entropy_list, dim=0)  # (num_layers, B)
-            attention_entropy_loss_B = attention_entropy_loss_B.mean(dim=0)  # (B,)
-            self.attention_entropy_loss = attention_entropy_loss_B
-            if not self.training:
-                print("[DEBUG] dit.forward: attention_entropy_loss", self.attention_entropy_loss)
-        else:
-            self.attention_entropy_loss = torch.zeros((1,), dtype=x_B_T_H_W_D.dtype)  # to be compatible with loss calculation in ddp model
 
         # NOTE: reformat video and action tokens
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
@@ -1174,19 +1357,24 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         action_B_HorizonDof = self.action_decoder_B_D(
             rearrange(action_emb_B_T_1_W_D, "b t 1 w d -> b (t w d)")
         )
-        # print("[DEBUG] dit.forward: after action_decoder", "action_B_HorizonDof", action_B_HorizonDof.shape,)
         action_B_Horizon_Dof = self.action_reshape(action_B_HorizonDof)  # (B, horizon, dof)
-        return x_B_C_Tt_Hp_Wp, action_B_Horizon_Dof
+
+        force_B_HorizonDof = self.force_decoder_B_D(
+            rearrange(force_emb_B_T_1_W_D, "b t 1 w d -> b (t w d)")
+        )
+        force_B_Horizon_Dof = self.force_reshape(force_B_HorizonDof)  # (B, horizon, dof)
+        return x_B_C_Tt_Hp_Wp, action_B_Horizon_Dof, force_B_Horizon_Dof
 
     def prepare_embedded_sequence(
         self,
         x_B_C_T_H_W: torch.Tensor,
         action_emb_B_T_1_1_D: torch.Tensor,
+        force_emb_B_T_1_1_D: torch.Tensor,
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         view_indices_B_T: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor],
-            Optional[torch.Tensor]]:
+            Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Prepares an embedded sequence tensor by applying positional embeddings and handling padding masks.
 
@@ -1240,11 +1428,10 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             x_B_C_V_T_H_W = torch.cat([x_B_C_V_T_H_W, view_embedding], dim=1)
             x_B_C_T_H_W = rearrange(x_B_C_V_T_H_W, " B C V T H W -> B C (V T) H W", V=n_cameras)
 
-        # print("[DEBUG] dit.prepare_embedded_sequence before embed", "x_B_C_T_H_W", x_B_C_T_H_W.shape,)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)  # ([12, 18, 5, 32, 32]) -> ([12, 5, 16, 16, 2048])
-        # print("[DEBUG] dit.prepare_embedded_sequence after embed", "x_B_T_H_W_D", x_B_T_H_W_D.shape,)
         B, T, H, W, D = x_B_T_H_W_D.shape
         action_emb_B_T_1_W_D = action_emb_B_T_1_1_D.repeat(1, 1, 1, self.ex_num_tokens_per_latent_frame, 1)  # ->(B,T,1,W,D)
+        force_emb_B_T_1_W_D = force_emb_B_T_1_1_D.repeat(1, 1, 1, self.force_num_tokens_per_latent_frame, 1)  # ->(B,T,1,W,D)
 
         if self.extra_per_block_abs_pos_emb:
             extra_pos_emb = self.extra_pos_embedder(x_B_T_H_W_D, fps=fps)
@@ -1252,36 +1439,28 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
             extra_pos_emb = None
 
         if "rope" in self.pos_emb_cls.lower():
-            assert hasattr(self, "expert_pos_embedder"), "pos_embedder not built"
+            assert hasattr(self, "expert_pos_embedder"), "expert_pos_embedder not built"
+            assert hasattr(self, "force_pos_embedder"), "force_pos_embedder not built"
             # NOTE: use expert_pos_embedder to process action embedding
             video_pos_emb_THW_1_1_D = self.pos_embedder(x_B_T_H_W_D, fps=fps)
             action_pos_emb_T1W_1_1_D = self.expert_pos_embedder(action_emb_B_T_1_W_D, fps=fps)
+            force_pos_emb_T1W_1_1_D = self.force_pos_embedder(force_emb_B_T_1_W_D, fps=fps)
 
             ## No need to cat rope embedding anymore, since we process them respectively in BlockWExpert
-            # def _cat_rope_emb(_video_emb_THW_1_1_D, _action_emb_T1W_1_1_D):
-            #     # reshape for convenience using rearrange
-            #     video_T_H_W_D = rearrange(_video_emb_THW_1_1_D, "(t h w) 1 1 d -> t h w d", t=T, h=H, w=W)
-            #     action_T_1_W_D = rearrange(_action_emb_T1W_1_1_D, "(t w) 1 1 d -> t 1 w d", t=T, w=W)
-            #
-            #     # cat at H-dim
-            #     combined_T_H1_W_D = torch.cat([video_T_H_W_D, action_T_1_W_D], dim=1)
-            #
-            #     # reshape back using rearrange
-            #     return rearrange(combined_T_H1_W_D, "t h w d -> (t h w) 1 1 d")
+            return (x_B_T_H_W_D, video_pos_emb_THW_1_1_D, extra_pos_emb,
+                    action_emb_B_T_1_W_D, action_pos_emb_T1W_1_1_D,
+                    force_emb_B_T_1_W_D, force_pos_emb_T1W_1_1_D
+                    )
 
-            # x_B_T_H_W_D = torch.cat([x_B_T_H_W_D, action_emb_B_T_1_W_D], dim=2)  # (B,T,H+1,W,D)
-            # cat_rope_emb_THW_1_1_D = _cat_rope_emb(video_pos_emb_THW_1_1_D, action_pos_emb_T1W_1_1_D)  # (T*(H+1)*W,1,1,D)
-
-            return x_B_T_H_W_D, video_pos_emb_THW_1_1_D, extra_pos_emb, action_emb_B_T_1_W_D, action_pos_emb_T1W_1_1_D
-            # return x_B_T_H_W_D, self.pos_embedder(x_B_T_H_W_D, fps=fps), extra_pos_emb
         x_B_T_H_W_D = x_B_T_H_W_D + self.pos_embedder(x_B_T_H_W_D)  # [B, T, H, W, D]
 
-        return x_B_T_H_W_D, None, extra_pos_emb, None, None
+        return x_B_T_H_W_D, None, extra_pos_emb, None, None, None, None
 
     def build_pos_embed(self) -> None:
         if self.pos_emb_cls == "rope3d":
             cls_type = VideoRopePosition3DEmb  # ori:VideoRopePosition3DEmb, or:MultiCameraVideoRopePosition3DEmb
             expert_cls_type = VideoRopePosition3DEmb
+            force_cls_type = VideoRopePosition3DEmb
         else:
             raise ValueError(f"Unknown pos_emb_cls {self.pos_emb_cls}")
 
@@ -1311,6 +1490,14 @@ class ExpertMinimalV1LVGDiT(MinimalV1LVGDiT):
         expert_kwargs["len_h"] = 1
         self.expert_pos_embedder = expert_cls_type(
             **expert_kwargs,  # type: ignore
+        )
+
+        # NOTE: add force pos_embedder
+        force_kwargs = kwargs.copy()  # keep most settings the same
+        force_kwargs["len_h"] = 1
+        force_kwargs["len_t"] = force_kwargs["len_t"] * 2
+        self.force_pos_embedder = force_cls_type(
+            **force_kwargs,  # type: ignore
         )
 
         if self.extra_per_block_abs_pos_emb:

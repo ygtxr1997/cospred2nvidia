@@ -148,6 +148,10 @@ class ImaginaireTrainer:
         model = model.to("cuda", memory_format=self.config.trainer.memory_format)  # type: ignore
         model.on_train_start(self.config.trainer.memory_format)
 
+        # Added for saving dataset metadata.
+        if distributed.is_rank0() and hasattr(dataloader_train.dataset, "save_meta"):
+            dataloader_train.dataset.save_meta(os.path.join(self.config.job.path_local, "statistics.json"))
+
         # Initialize the optimizer, scheduler, and grad_scaler.
         self.callbacks.on_optimizer_init_start()
         optimizer, scheduler = model.init_optimizer_scheduler(self.config.optimizer, self.config.scheduler)

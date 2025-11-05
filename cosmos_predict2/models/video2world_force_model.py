@@ -24,19 +24,18 @@ from megatron.core import parallel_state
 from torch.distributed.device_mesh import init_device_mesh
 
 from cosmos_predict2.models.video2world_model import Predict2Video2WorldModel, Predict2Video2WorldModelConfig
-# from cosmos_predict2.pipelines.video2world_action import Video2WorldActionConditionedPipeline
-from cosmos_predict2.pipelines.video2world_expert import Video2WorldExpertPipeline, DenoisePredictionWithAction
-from cosmos_predict2.conditioner import ActionCondition, DataType
+from cosmos_predict2.pipelines.video2world_force import Video2WorldForcePipeline, DenoisePredictionWithForce  # modified
+from cosmos_predict2.conditioner import ForceCondition, DataType
 from cosmos_predict2.utils.vis_helpers import save_action_as_image
 from imaginaire.utils.io import save_image_or_video
 from imaginaire.model import ImaginaireModel
 from imaginaire.utils import log
 
 
-class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
+class Predict2Video2WorldForceModel(Predict2Video2WorldModel):
     def __init__(self, config: Predict2Video2WorldModelConfig,
                  load_ema: bool = False,  # used in inference api
-                 text_encoder_path: str = "",
+                 text_encoder_path: str = "",  # used in inference api
                  ):
         super(ImaginaireModel, self).__init__()
 
@@ -70,7 +69,7 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
             self.data_parallel_size = 1
 
         # NOTE: replace the pipeline with expert pipeline
-        self.pipe: Video2WorldExpertPipeline = Video2WorldExpertPipeline.from_config(
+        self.pipe: Video2WorldForcePipeline = Video2WorldForcePipeline.from_config(
             config.pipe_config,
             dit_path=config.model_manager_config.dit_path,
             load_ema_to_reg=load_ema,
@@ -122,13 +121,17 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
     def compute_loss_with_epsilon_and_sigma(
         self,
         x0_B_C_T_H_W: torch.Tensor,
-        condition: ActionCondition,
+        condition: ForceCondition,
         epsilon_B_C_T_H_W: torch.Tensor,
         sigma_B_T: torch.Tensor,
         # Action related.
         action0_B_T_D: torch.Tensor = None,
         action_epsilon_B_T_D: torch.Tensor = None,
         action_sigma_B_T: torch.Tensor = None,
+        # Force related.
+        force0_B_T_D: torch.Tensor = None,
+        force_epsilon_B_T_D: torch.Tensor = None,
+        force_sigma_B_T: torch.Tensor = None,
     ) -> Tuple[dict, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         Compute loss givee epsilon and sigma
@@ -186,17 +189,18 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
         ## [2] Action branch
         action_mean_B_T_D, action_std_B_T = action0_B_T_D, action_sigma_B_T  # Action condition shares the same sigma with Video.
         actiont_B_T_D = action_mean_B_T_D + action_epsilon_B_T_D * rearrange(action_std_B_T, "b t -> b t 1")
+        ## [3] Force branch
+        force_mean_B_T_D, force_std_B_T = force0_B_T_D, force_sigma_B_T  # shares the same sigma with Video.
+        forcet_B_T_D = force_mean_B_T_D + force_epsilon_B_T_D * rearrange(force_std_B_T, "b t -> b t 1")
 
         # make prediction
-        model_pred: DenoisePredictionWithAction = self.pipe.denoise(xt_B_C_T_H_W, sigma_B_T, condition,
-                                                                    at_B_T_D=actiont_B_T_D,
-                                                                    a_sigma=action_sigma_B_T,
-                                                                    )
+        model_pred: DenoisePredictionWithForce = self.pipe.denoise(
+            xt_B_C_T_H_W, sigma_B_T, condition,
+            at_B_T_D=actiont_B_T_D, a_sigma=action_sigma_B_T,
+            forcet_B_T_D=forcet_B_T_D, force_sigma=force_sigma_B_T
+        )
         # loss weights for different noise levels
         weights_per_sigma_B_T = self.get_per_sigma_loss_weights(sigma=sigma_B_T)
-
-        entropy_loss = self.pipe.dit.attention_entropy_loss  # shape: (B,)
-        # print("[DEBUG] compute_loss_with_epsilon_and_sigma: attention_entropy_loss:", entropy_loss.shape, entropy_loss.mean().item())
 
         # extra loss mask for each sample, for example, human faces, hands
         # [1] Video
@@ -205,25 +209,27 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
         # [2] Action
         action_pred_mse_B_T_D = (action0_B_T_D - model_pred.action0) ** 2
         action_edm_loss_B_T_D = action_pred_mse_B_T_D * rearrange(weights_per_sigma_B_T, "b t -> b t 1")
-        # [3] Attention entropy
-        entropy_loss_B_T = entropy_loss.unsqueeze(1).repeat(1, sigma_B_T.shape[1])  # shape: (B, T)
-        # entropy_loss_B_T = entropy_loss_B_T * weights_per_sigma_B_T  # shape: (B, T), do not weight it can work better?
+        # [3] Force
+        force_pred_mse_B_T_D = (force0_B_T_D - model_pred.force0) ** 2
+        force_edm_loss_B_T_D = force_pred_mse_B_T_D * rearrange(weights_per_sigma_B_T, "b t -> b t 1")
 
         ## DEBUG: visualize the action prediction
         # import torch.distributed as dist
-        # if os.environ.get("LOCAL_RANK", "0") == "1":
+        # if os.environ.get("LOCAL_RANK", "0") == "0":
         #     save_action_as_image(action0_B_T_D[0, :, :3].detach().float().detach().cpu().numpy(), "output/tmp_action0.png")
         #     save_action_as_image(model_pred.action0[0, :, :3].detach().float().cpu().numpy(), "output/tmp_action0_pred.png")
+        #     save_action_as_image(force0_B_T_D[0, :, :3].detach().float().detach().cpu().numpy(),"output/tmp_force0.png")
+        #     save_action_as_image(model_pred.force0[0, :, :3].detach().float().cpu().numpy(),"output/tmp_force0_pred.png")
         #     vis_x0_in = self.pipe.decode(x0_B_C_T_H_W[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
         #     vis_x0_pred = self.pipe.decode(model_pred.x0[:2])  # shape: (B, C, T, H, W), possibly out of [-1, 1]
-        #     save_image_or_video(vis_x0_in[0, :3].detach().cpu(), "output/tmp_x0.mp4", fps=15)
-        #     save_image_or_video(vis_x0_pred[0, :3].detach().cpu(), "output/tmp_x0_pred.mp4", fps=15)
+        #     save_image_or_video(vis_x0_in[0, :3].detach().cpu(), "output/tmp_x0.mp4", fps=5)
+        #     save_image_or_video(vis_x0_pred[0, :3].detach().cpu(), "output/tmp_x0_pred.mp4", fps=5)
         # dist.barrier()
         # exit()
 
         kendall_loss = edm_loss_B_C_T_H_W
         action_kendall_loss = action_edm_loss_B_T_D
-        attention_entropy_kendall_loss = entropy_loss_B_T
+        force_kendall_loss = force_edm_loss_B_T_D
 
         output_batch = {
             "x0": x0_B_C_T_H_W,
@@ -239,14 +245,17 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
             "edm_loss_per_frame": torch.mean(edm_loss_B_C_T_H_W, dim=[1, 3, 4]),
             "action_mse_loss": action_pred_mse_B_T_D.mean(),  # action loss
             "action_edm_loss": action_edm_loss_B_T_D.mean(),  # action loss
+            "force_mse_loss": force_pred_mse_B_T_D.mean(),  # force loss
+            "force_edm_loss": force_edm_loss_B_T_D.mean(),  # force loss
         }
-        output_batch["loss"] = (
-                kendall_loss.mean() + action_kendall_loss.mean() + (attention_entropy_kendall_loss.mean() * -0.0)
-        )  # check if this is what we want. attention entropy is disabled
+        output_batch["loss"] = (kendall_loss.mean()
+                                + action_kendall_loss.mean()
+                                + force_kendall_loss.mean())
+        # check if this is what we want
         kendall_loss_dict = {
             "kendall_loss": kendall_loss,
             "action_kendall_loss": action_kendall_loss,
-            "attention_entropy_kendall_loss": attention_entropy_kendall_loss,
+            "force_kendall_loss": force_kendall_loss,
         }
         # print("[DEBUG] compute_loss_with_epsilon_and_sigma:",
         #       "video_mse:", output_batch["mse_loss"].item(),
@@ -262,15 +271,10 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
         self._update_train_stats(data_batch)
 
         # Get the input data to noise and denoise~(image, video) and the corresponding conditioner.
-        condition: ActionCondition
+        condition: ForceCondition
         raw_B_C_T_H_W, x0_B_C_T_H_W, condition = self.pipe.get_data_and_condition(data_batch)  # x0 is in latent space
         action0_B_T_D = condition.gt_actions  # T=horizon, D=action_dof
-        # print("[DEBUG] training_step:", "x0_B_C_T_H_W.shape", x0_B_C_T_H_W.shape,
-        #       "action0_B_T_D.shape", action0_B_T_D.shape)
-        '''
-        x0_B_C_T_H_W.shape torch.Size([12, 16, 5*, 32, 32]) 
-        action0_B_T_D.shape torch.Size([12, 12*, 2])
-        '''
+        force0_B_T_D = condition.gt_forces
         # DEBUG. Visualize the input data and condition
         # print("[DEBUG] training_step:", "raw_state", raw_B_C_T_H_W[0].min(), raw_B_C_T_H_W[0].max(),)
         # save_image_or_video(raw_B_C_T_H_W[0].float().detach().cpu() * 0.5 + 0.5, "output/tmp_raw_state.mp4", fps=5)
@@ -284,10 +288,14 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
         # action_sigma_placeholder = action_sigma_placeholder[:, : (action0_B_T_D.shape[1] // 3), :]  # T=action_latent_t
         action_sigma_B_T, action_epsilon_B_T_D = self.draw_training_sigma_and_epsilon(
             action0_B_T_D.size(), condition)
+        force_sigma_B_T, force_epsilon_B_T_D = self.draw_training_sigma_and_epsilon(
+            force0_B_T_D.size(), condition)
         _, Ts = sigma_B_T.shape  # Ts=1
         action_sigma_B_T[:, :Ts] = sigma_B_T  # Action condition and video share the same sigma.
         # action_epsilon_B_T_D = torch.randn_like(action0_B_T_D, device=action0_B_T_D.device)
         # print("[DEBUG] training_step:", "sigma_B_T", sigma_B_T, "action_sigma_B_T", action_sigma_B_T)
+        _, Tf = force_sigma_B_T.shape  # Tf=1
+        force_sigma_B_T[:, :Tf] = sigma_B_T  # Force condition and video share the same sigma.
         '''
         sigma_B_T.shape: torch.Size([12, 1])
         action_sigma_B_T.shape: torch.Size([12, 1])
@@ -299,20 +307,28 @@ class Predict2Video2WorldExpertModel(Predict2Video2WorldModel):
         )  # Not supported yet.
         output_batch, kendall_loss_dict, _, _ = self.compute_loss_with_epsilon_and_sigma(
             x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T,
+            # Action
             action0_B_T_D=action0_B_T_D,
             action_epsilon_B_T_D=action_epsilon_B_T_D,
             action_sigma_B_T=action_sigma_B_T,
+            # Force
+            force0_B_T_D=force0_B_T_D,
+            force_epsilon_B_T_D=force_epsilon_B_T_D,
+            force_sigma_B_T=force_sigma_B_T,
         )
 
+        # NOTE: remember to reduce the loss properly if adding any new loss term
         if self.loss_reduce == "mean":
             kendall_loss = (
                 kendall_loss_dict['kendall_loss'].mean() * self.loss_scale
                 + kendall_loss_dict['action_kendall_loss'].mean() * self.loss_scale
+                + kendall_loss_dict['force_kendall_loss'].mean() * self.loss_scale
             )
         elif self.loss_reduce == "sum":
             kendall_loss = (
                 kendall_loss_dict['kendall_loss'].sum(dim=1).mean() * self.loss_scale  # C-dim
                 + kendall_loss_dict['action_kendall_loss'].sum(dim=2).mean() * self.loss_scale  # D-dim
+                + kendall_loss_dict['force_kendall_loss'].sum(dim=2).mean() * self.loss_scale  # D-dim
             )
         else:
             raise ValueError(f"Invalid loss_reduce: {self.loss_reduce}")

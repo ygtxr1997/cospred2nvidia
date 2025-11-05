@@ -16,7 +16,7 @@
 from typing import Tuple
 import attrs
 
-from cosmos_predict2.conditioner import ActionConditioner, BooleanFlag, ReMapkey, TextAttr
+from cosmos_predict2.conditioner import ForceConditioner, BooleanFlag, ReMapkey, TextAttr
 from cosmos_predict2.configs.base.config_video2world import (
     ConditioningStrategy,
     CosmosGuardrailConfig,
@@ -26,8 +26,9 @@ from cosmos_predict2.configs.base.config_video2world import (
 from cosmos_predict2.configs.base.config_text2image import CosmosGuardrailConfig, SolverTimestampConfig
 from cosmos_predict2.configs.base.defaults.ema import EMAConfig
 from cosmos_predict2.models.text2image_dit import SACConfig
-# from cosmos_predict2.models.video2world_action_dit import ActionConditionedMinimalV1LVGDiT
-from cosmos_predict2.models.video2world_expert_dit import ExpertMinimalV1LVGDiT
+
+from cosmos_predict2.models.video2world_force_dit import ExpertMinimalV1LVGDiT
+
 from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
 from imaginaire.config import make_freezable
 from imaginaire.lazy_config import LazyCall as L
@@ -37,17 +38,19 @@ from imaginaire.utils import log
 
 @make_freezable
 @attrs.define(slots=False)
-class Video2WorldExpertPipelineConfig(Video2WorldPipelineConfig):
+class Video2WorldForcePipelineConfig(Video2WorldPipelineConfig):
     # action related
     input_action_key: str = "action"
     input_agent_pos_key: str = "agent_pos"
     max_obs: int = 5
     max_act_out: int = 12
     p_all_actions_as_condition: float = 0.5
+    # force related
+    input_force_key: str = "force"  # len(force) = max_obs + max_act_out
 
 
 # Modified: action_conditioned/config.py PREDICT2_VIDEO2WORLD_NET_2B_ACTION_CONDITIONED
-PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
+PREDICT2_VIDEO2WORLD_NET_2B_FORCE = L(ExpertMinimalV1LVGDiT)(
     max_img_h=240,
     max_img_w=240,
     max_frames=128,
@@ -76,9 +79,8 @@ PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
         every_n_blocks=1,
         mode="predict2_2b_720",
     ),
-    # NOTE: add action dimension
-    action_dim=2 * 12,  # (act_dim * horizon), ori:7*12
     # NOTE: add expert params
+    action_dim=2 * 12,  # (act_dim * horizon), ori:7*12
     action_dof=2,  # pusht: 2-DoF; robotic arm: 7-DoF;
     ex_num_latent_frames=12,  # (B,T,1,W,D), T=num_latent_frames, can be different from video, latent and ori action are consistent, good?
     ex_num_tokens_per_latent_frame=1,  # W=num_tokens_per_frame, embeddings repeat times
@@ -86,6 +88,15 @@ PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
     ex_num_heads=16,
     ex_mlp_ratio=4.0,
     ex_adaln_lora_dim=128,
+    # NOTE: add force params
+    force_raw_dim=6 * (5 + 12),  # (dim * n_obs),
+    force_raw_dof=6,
+    force_num_latent_frames=12,  # (B,T,1,W,D), T=num_latent_frames, can be different from video, latent and ori action are consistent, good?
+    force_num_tokens_per_latent_frame=1,  # W=num_tokens_per_frame, embeddings repeat times
+    force_dim=512,  # expert feature dimension, D=dim
+    force_num_heads=16,
+    force_mlp_ratio=4.0,
+    force_adaln_lora_dim=128,
     # NOTE: add agent pos params
     extra_robot_states_dim=2 * 5,  # (dim * n_obs), dim: e.g., libero: joint_states 7 + gripper_state 1 (or pusht: 2)
     # NOTE: add multi-view params
@@ -96,9 +107,9 @@ PREDICT2_VIDEO2WORLD_NET_2B_EXPERT = L(ExpertMinimalV1LVGDiT)(
 )
 
 # Modified: action_conditioned/config.py PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
-PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldExpertPipelineConfig(
+PREDICT2_VIDEO2WORLD_PIPELINE_2B_FORCE = Video2WorldForcePipelineConfig(
     adjust_video_noise=True,
-    conditioner=L(ActionConditioner)(
+    conditioner=L(ForceConditioner)(
         fps=L(ReMapkey)(
             dropout_rate=0.0,
             dtype=None,
@@ -120,11 +131,17 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldExpertPipelineConfig(
             input_key="fps",
             output_key="use_video_condition",
         ),
-        ## NOTE: unlike action_conditioned, expert takes action as additional input instead of crossattn_emb
         # NOTE: add additional action as condition
         action=L(ReMapkey)(
             input_key="action",
             output_key="action",
+            dropout_rate=0.0,
+            dtype=None,
+        ),
+        # NOTE: add additional force as condition
+        force=L(ReMapkey)(
+            input_key="force",
+            output_key="force",
             dropout_rate=0.0,
             dtype=None,
         ),
@@ -145,7 +162,7 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldExpertPipelineConfig(
     conditioning_strategy=str(ConditioningStrategy.FRAME_REPLACE),
     min_num_conditional_frames=1,
     max_num_conditional_frames=1,
-    net=PREDICT2_VIDEO2WORLD_NET_2B_EXPERT,  # modified
+    net=PREDICT2_VIDEO2WORLD_NET_2B_FORCE,  # modified
     precision="bfloat16",
     rectified_flow_t_scaling_factor=1.0,
     rectified_flow_loss_weight_uniform=True,
@@ -174,25 +191,22 @@ PREDICT2_VIDEO2WORLD_PIPELINE_2B_EXPERT = Video2WorldExpertPipelineConfig(
         offload_model_to_cpu=True,
         enabled=False,
     ),
-    # action related
+    # action related, also used by force
     max_obs=5,
     max_act_out=12,
     p_all_actions_as_condition=0.3,
 )
 
 
-def create_config_from_checkpoint(config_dict) -> Tuple[Video2WorldExpertPipelineConfig, dict]:
-    """从加载的配置字典创建 Video2WorldExpertPipelineConfig 对象"""
+def create_config_from_checkpoint(config_dict) -> Tuple[Video2WorldForcePipelineConfig, dict]:
+    """从加载的配置字典创建 Video2WorldForcePipelineConfig 对象"""
     try:
         if hasattr(config_dict, 'model') and hasattr(config_dict.model, 'config') and hasattr(config_dict.model.config,
                                                                                               'pipe_config'):
             pipe_config = config_dict.model.config.pipe_config
-            if hasattr(config_dict.dataloader_train, 'dataset'):
-                dataset_config = config_dict.dataloader_train.dataset
-            else:
-                dataset_config = None
+            dataset_config = config_dict.dataloader_train.dataset
 
-            if isinstance(pipe_config, Video2WorldExpertPipelineConfig):
+            if isinstance(pipe_config, Video2WorldForcePipelineConfig):
                 log.info("Successfully loaded pipe_config from pkl file")
                 return pipe_config, dataset_config
             else:
